@@ -1,197 +1,908 @@
-import sqlite3
 import os
-import streamlit as st
+import sqlite3
+import uuid
+from datetime import datetime, date
+from pathlib import Path
+
 import pandas as pd
-from datetime import datetime
+import streamlit as st
 
-# إعدادات واجهة الموبايل العريضة والتصميم
-st.set_page_config(page_title="برنامج ميدو - Mido ERP", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="MIDO ERP", page_icon="🤖", layout="wide", initial_sidebar_state="expanded")
 
-# 1. إعداد قاعدة البيانات ومجلد الملفات
 DB_NAME = "mido_database.db"
-UPLOAD_DIR = "mido_dropbox_files"
+UPLOAD_DIR = Path("mido_files")
+UPLOAD_DIR.mkdir(exist_ok=True)
 
-if not os.path.exists(UPLOAD_DIR):
-    os.makedirs(UPLOAD_DIR)
+# -------------------- Styling --------------------
+st.markdown(
+    """
+    <style>
+    .block-container {padding-top: 1.4rem; padding-bottom: 2rem;}
+    .mido-hero {background:linear-gradient(135deg,#0b132b,#24375f); color:white; padding:24px; border-radius:18px; margin-bottom:18px;}
+    .mido-hero h2 {margin:0 0 8px 0;}
+    .soft-card {background:#ffffff; border:1px solid #e7ebf2; border-radius:14px; padding:16px; margin-bottom:12px;}
+    .muted {color:#6b7280; font-size:0.92rem;}
+    .small {font-size:0.85rem;}
+    div[data-testid="stMetric"] {background:white; border:1px solid #e7ebf2; border-radius:14px; padding:14px;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# -------------------- Database --------------------
+def get_conn():
+    conn = sqlite3.connect(DB_NAME, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
 
 def init_db():
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_conn()
     c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS suppliers (
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS companies (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            company_name TEXT,
-            bank_account TEXT,
-            order_details TEXT,
-            payment_date TEXT,
-            shipment_status TEXT,
-            unit_price REAL,
-            total_amount REAL
+            company_name TEXT NOT NULL,
+            country TEXT DEFAULT 'China',
+            city TEXT,
+            contact_person TEXT,
+            phone TEXT,
+            whatsapp TEXT,
+            email TEXT,
+            website TEXT,
+            brands TEXT,
+            payment_terms TEXT,
+            notes TEXT,
+            created_at TEXT NOT NULL
         )
-    ''')
-    c.execute('''
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS bank_accounts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            company_id INTEGER NOT NULL,
+            bank_name TEXT,
+            beneficiary_name TEXT,
+            account_number TEXT,
+            iban TEXT,
+            swift TEXT,
+            bank_address TEXT,
+            currency TEXT DEFAULT 'USD',
+            notes TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(company_id) REFERENCES companies(id) ON DELETE CASCADE
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            company_id INTEGER NOT NULL,
+            order_number TEXT,
+            order_date TEXT,
+            product_summary TEXT,
+            quantity REAL DEFAULT 0,
+            currency TEXT DEFAULT 'USD',
+            total_amount REAL DEFAULT 0,
+            paid_amount REAL DEFAULT 0,
+            status TEXT,
+            notes TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(company_id) REFERENCES companies(id) ON DELETE CASCADE
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS invoices (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            company_id INTEGER NOT NULL,
+            order_id INTEGER,
+            invoice_number TEXT,
+            invoice_date TEXT,
+            due_date TEXT,
+            currency TEXT DEFAULT 'USD',
+            amount REAL DEFAULT 0,
+            status TEXT,
+            notes TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(company_id) REFERENCES companies(id) ON DELETE CASCADE,
+            FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE SET NULL
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            company_id INTEGER NOT NULL,
+            order_id INTEGER,
+            invoice_id INTEGER,
+            bank_account_id INTEGER,
+            payment_type TEXT,
+            due_date TEXT,
+            payment_date TEXT,
+            currency TEXT DEFAULT 'USD',
+            amount REAL DEFAULT 0,
+            status TEXT,
+            reference TEXT,
+            notes TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(company_id) REFERENCES companies(id) ON DELETE CASCADE,
+            FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE SET NULL,
+            FOREIGN KEY(invoice_id) REFERENCES invoices(id) ON DELETE SET NULL,
+            FOREIGN KEY(bank_account_id) REFERENCES bank_accounts(id) ON DELETE SET NULL
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS shipments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            company_id INTEGER NOT NULL,
+            order_id INTEGER,
+            shipment_number TEXT,
+            container_number TEXT,
+            bl_number TEXT,
+            shipping_line TEXT,
+            loading_port TEXT,
+            destination_port TEXT,
+            etd TEXT,
+            eta TEXT,
+            status TEXT,
+            quantity_containers INTEGER DEFAULT 1,
+            tracking_url TEXT,
+            notes TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(company_id) REFERENCES companies(id) ON DELETE CASCADE,
+            FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE SET NULL
+        )
+    """)
+
+    c.execute("""
         CREATE TABLE IF NOT EXISTS documents (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            company_id INTEGER,
-            file_name TEXT,
-            file_path TEXT,
-            upload_date TEXT,
-            FOREIGN KEY(company_id) REFERENCES suppliers(id)
+            company_id INTEGER NOT NULL,
+            order_id INTEGER,
+            shipment_id INTEGER,
+            invoice_id INTEGER,
+            document_type TEXT,
+            file_name TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            upload_date TEXT NOT NULL,
+            notes TEXT,
+            FOREIGN KEY(company_id) REFERENCES companies(id) ON DELETE CASCADE,
+            FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE SET NULL,
+            FOREIGN KEY(shipment_id) REFERENCES shipments(id) ON DELETE SET NULL,
+            FOREIGN KEY(invoice_id) REFERENCES invoices(id) ON DELETE SET NULL
         )
-    ''')
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS prices (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            company_id INTEGER NOT NULL,
+            product_name TEXT NOT NULL,
+            specification TEXT,
+            brand TEXT,
+            quantity REAL DEFAULT 0,
+            unit_price REAL DEFAULT 0,
+            currency TEXT DEFAULT 'USD',
+            incoterm TEXT,
+            quote_date TEXT,
+            valid_until TEXT,
+            notes TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(company_id) REFERENCES companies(id) ON DELETE CASCADE
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS agencies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            company_id INTEGER,
+            brand_name TEXT NOT NULL,
+            agency_holder TEXT,
+            territory TEXT DEFAULT 'Iraq',
+            exclusivity TEXT,
+            start_date TEXT,
+            end_date TEXT,
+            notes TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(company_id) REFERENCES companies(id) ON DELETE SET NULL
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS notes_tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            company_id INTEGER,
+            title TEXT,
+            details TEXT,
+            due_date TEXT,
+            priority TEXT,
+            status TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(company_id) REFERENCES companies(id) ON DELETE CASCADE
+        )
+    """)
+
     conn.commit()
     conn.close()
 
+
 init_db()
 
-# --- القائمة الجانبية للتنقل ---
-st.sidebar.title("📱 برنامج ميدو الذكي")
+
+def now_text():
+    return datetime.now().strftime("%Y-%m-%d %H:%M")
+
+
+def fetch_df(sql, params=()):
+    conn = get_conn()
+    try:
+        return pd.read_sql_query(sql, conn, params=params)
+    finally:
+        conn.close()
+
+
+def execute(sql, params=()):
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def company_options():
+    df = fetch_df("SELECT id, company_name FROM companies ORDER BY company_name")
+    return {f"{r.company_name} (#{int(r.id)})": int(r.id) for r in df.itertuples()}
+
+
+def optional_order_options(company_id=None):
+    if company_id:
+        df = fetch_df("SELECT id, order_number FROM orders WHERE company_id=? ORDER BY id DESC", (company_id,))
+    else:
+        df = fetch_df("SELECT id, order_number FROM orders ORDER BY id DESC")
+    opts = {"بدون ربط": None}
+    for r in df.itertuples():
+        opts[f"{r.order_number or 'طلبية'} (#{int(r.id)})"] = int(r.id)
+    return opts
+
+
+def optional_invoice_options(company_id=None):
+    if company_id:
+        df = fetch_df("SELECT id, invoice_number FROM invoices WHERE company_id=? ORDER BY id DESC", (company_id,))
+    else:
+        df = fetch_df("SELECT id, invoice_number FROM invoices ORDER BY id DESC")
+    opts = {"بدون ربط": None}
+    for r in df.itertuples():
+        opts[f"{r.invoice_number or 'فاتورة'} (#{int(r.id)})"] = int(r.id)
+    return opts
+
+
+def optional_shipment_options(company_id=None):
+    if company_id:
+        df = fetch_df("SELECT id, container_number, shipment_number FROM shipments WHERE company_id=? ORDER BY id DESC", (company_id,))
+    else:
+        df = fetch_df("SELECT id, container_number, shipment_number FROM shipments ORDER BY id DESC")
+    opts = {"بدون ربط": None}
+    for r in df.itertuples():
+        label = r.container_number or r.shipment_number or "شحنة"
+        opts[f"{label} (#{int(r.id)})"] = int(r.id)
+    return opts
+
+
+def optional_bank_options(company_id=None):
+    if company_id:
+        df = fetch_df("SELECT id, bank_name, beneficiary_name FROM bank_accounts WHERE company_id=? ORDER BY id DESC", (company_id,))
+    else:
+        df = fetch_df("SELECT id, bank_name, beneficiary_name FROM bank_accounts ORDER BY id DESC")
+    opts = {"بدون ربط": None}
+    for r in df.itertuples():
+        opts[f"{r.bank_name or 'Bank'} - {r.beneficiary_name or ''} (#{int(r.id)})"] = int(r.id)
+    return opts
+
+
+def save_uploaded_file(uploaded_file, company_id):
+    company_dir = UPLOAD_DIR / f"company_{company_id}"
+    company_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}_{uploaded_file.name}"
+    file_path = company_dir / safe_name
+    with open(file_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+    return str(file_path)
+
+
+def money(v, currency="USD"):
+    try:
+        return f"{float(v):,.2f} {currency}"
+    except Exception:
+        return f"0.00 {currency}"
+
+
+# -------------------- Sidebar --------------------
+st.sidebar.title("🤖 MIDO")
+st.sidebar.caption("مساعد محمد التجاري")
 st.sidebar.markdown("---")
-menu = ["📊 لوحة التحكم الرئيسية", "🏢 الشركات الصينية والدفعات", "📁 دروب بوكس المستندات (PDF)", "📈 مقارنة أسعار المعامل", "📞 مركز الاتصالات الذكي (AI)"]
-choice = st.sidebar.radio("اختر القسم:", menu)
+menu = [
+    "📊 لوحة التحكم",
+    "🏭 الشركات الصينية",
+    "🧾 الطلبيات",
+    "💵 الفواتير",
+    "🚢 الشحنات",
+    "💳 الدفعات",
+    "🏦 الحسابات البنكية",
+    "📁 المستندات الأصلية",
+    "📈 مقارنة الأسعار",
+    "🤝 الوكالات",
+    "📝 المتابعة والمهام",
+    "🤖 ميدو AI",
+]
+choice = st.sidebar.radio("القسم", menu)
+st.sidebar.markdown("---")
+st.sidebar.caption("النسخة الحالية تحفظ البيانات محلياً في SQLite والملفات داخل مجلد mido_files.")
 
-# --- القسم الأول: لوحة التحكم (Dashboard) ---
-if choice == "📊 لوحة التحكم الرئيسية":
-    st.title("📊 لوحة الإحصائيات والتنبهات")
-    
-    conn = sqlite3.connect(DB_NAME)
-    df_suppliers = pd.read_sql_query("SELECT * FROM suppliers", conn)
-    df_docs = pd.read_sql_query("SELECT * FROM documents", conn)
-    conn.close()
-    
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("إجمالي الشركات المسجلة", len(df_suppliers))
-    with col2:
-        total_val = df_suppliers["total_amount"].sum() if not df_suppliers.empty and "total_amount" in df_suppliers.columns else 0.0
-        st.metric("إجمالي المبالغ والالتزامات", f"${total_val:,.2f}")
-    with col3:
-        st.metric("عدد الملفات بأرشيف دروب بوكس", len(df_docs))
-        
+# -------------------- Dashboard --------------------
+if choice == "📊 لوحة التحكم":
+    st.markdown("<div class='mido-hero'><h2>مرحباً محمد 👋</h2><div>كل شركاتك وطلبياتك وشحناتك ودفعاتك في مكان واحد.</div></div>", unsafe_allow_html=True)
+
+    counts = {
+        "companies": fetch_df("SELECT COUNT(*) n FROM companies").iloc[0, 0],
+        "orders": fetch_df("SELECT COUNT(*) n FROM orders").iloc[0, 0],
+        "shipments": fetch_df("SELECT COUNT(*) n FROM shipments WHERE status NOT LIKE '%استلام%' AND status NOT LIKE '%وصلت%'").iloc[0, 0],
+        "docs": fetch_df("SELECT COUNT(*) n FROM documents").iloc[0, 0],
+    }
+    unpaid = fetch_df("SELECT COALESCE(SUM(amount),0) total FROM payments WHERE status NOT IN ('مدفوعة','تم الدفع')").iloc[0, 0]
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("الشركات", int(counts["companies"]))
+    c2.metric("الطلبيات", int(counts["orders"]))
+    c3.metric("الشحنات النشطة", int(counts["shipments"]))
+    c4.metric("المستندات", int(counts["docs"]))
+    c5.metric("دفعات غير مسددة", money(unpaid))
+
     st.markdown("---")
-    st.subheader("🚛 حالة الشحنات الحالية بالطريق")
-    if not df_suppliers.empty:
-        st.dataframe(df_suppliers[["company_name", "shipment_status", "payment_date", "unit_price"]], use_container_width=True)
-    else:
-        st.info("لا توجد شركات أو شحنات مسجلة حالياً.")
+    left, right = st.columns(2)
+    with left:
+        st.subheader("🚢 الشحنات بالطريق")
+        shp = fetch_df("""
+            SELECT s.id, c.company_name AS الشركة, s.container_number AS الحاوية,
+                   s.bl_number AS BL, s.destination_port AS الوجهة, s.eta AS ETA, s.status AS الحالة
+            FROM shipments s JOIN companies c ON c.id=s.company_id
+            ORDER BY CASE WHEN s.eta IS NULL OR s.eta='' THEN 1 ELSE 0 END, s.eta ASC LIMIT 10
+        """)
+        if shp.empty:
+            st.info("لا توجد شحنات مسجلة.")
+        else:
+            st.dataframe(shp, use_container_width=True, hide_index=True)
 
-# --- القسم الثاني: إدخال الشركات والحسابات ---
-elif choice == "🏢 الشركات الصينية والدفعات":
-    st.title("🏢 إدارة الشركات الصينية والحسابات البنكية")
-    
-    with st.expander("➕ إضافة شركة صينية / شحنة جديدة", expanded=True):
-        with st.form("add_supplier_form"):
-            col1, col2 = st.columns(2)
-            with col1:
-                name = st.text_input("اسم الشركة / المصنع الصيني")
-                bank = st.text_input("تفاصيل الحساب البنكي (IBAN / Bank Details)")
-                price = st.number_input("سعر القطعة الواحدة ($)", min_value=0.0, step=0.1)
-                total = st.number_input("إجمالي قيمة الفاتورة ($)", min_value=0.0, step=10.0)
-            with col2:
-                order = st.text_area("تفاصيل الطلبية والمنتجات")
-                pay_date = st.date_input("موعد الدفعة القادمة")
-                status = st.selectbox("حالة الشحنة", ["في المعمل (تحت التصنيع)", "تم الشحن بحري 🚢", "تم الشحن جوي ✈️", "وصلت للميناء/الجمارك 🛃", "تم الاستلام بالكامل ✅"])
-            
-            submit = st.form_submit_button("💾 حفظ البيانات بقاعدة البيانات")
-            if submit:
-                if name:
-                    conn = sqlite3.connect(DB_NAME)
-                    c = conn.cursor()
-                    c.execute("INSERT INTO suppliers (company_name, bank_account, order_details, payment_date, shipment_status, unit_price, total_amount) VALUES (?,?,?,?,?,?,?)",
-                              (name, bank, order, str(pay_date), status, price, total))
-                    conn.commit()
-                    conn.close()
-                    st.success(f"تم حفظ بيانات شركة ({name}) بنجاح!")
-                    st.rerun()
+    with right:
+        st.subheader("💳 الدفعات القادمة")
+        pay = fetch_df("""
+            SELECT p.id, c.company_name AS الشركة, p.amount AS المبلغ, p.currency AS العملة,
+                   p.due_date AS الاستحقاق, p.status AS الحالة
+            FROM payments p JOIN companies c ON c.id=p.company_id
+            WHERE p.status NOT IN ('مدفوعة','تم الدفع')
+            ORDER BY CASE WHEN p.due_date IS NULL OR p.due_date='' THEN 1 ELSE 0 END, p.due_date ASC LIMIT 10
+        """)
+        if pay.empty:
+            st.info("لا توجد دفعات قادمة.")
+        else:
+            st.dataframe(pay, use_container_width=True, hide_index=True)
+
+    st.subheader("📝 مهام تحتاج متابعة")
+    tasks = fetch_df("""
+        SELECT n.id, COALESCE(c.company_name,'عام') AS الشركة, n.title AS المهمة,
+               n.due_date AS الموعد, n.priority AS الأولوية, n.status AS الحالة
+        FROM notes_tasks n LEFT JOIN companies c ON c.id=n.company_id
+        WHERE n.status NOT IN ('مكتملة','تم')
+        ORDER BY CASE WHEN n.due_date IS NULL OR n.due_date='' THEN 1 ELSE 0 END, n.due_date ASC LIMIT 12
+    """)
+    if tasks.empty:
+        st.info("لا توجد مهام مفتوحة.")
+    else:
+        st.dataframe(tasks, use_container_width=True, hide_index=True)
+
+# -------------------- Companies --------------------
+elif choice == "🏭 الشركات الصينية":
+    st.title("🏭 الشركات الصينية")
+    tab1, tab2 = st.tabs(["📋 الشركات", "➕ إضافة شركة"])
+
+    with tab2:
+        with st.form("add_company"):
+            a, b = st.columns(2)
+            with a:
+                name = st.text_input("اسم الشركة / المصنع *")
+                country = st.text_input("الدولة", value="China")
+                city = st.text_input("المدينة")
+                contact = st.text_input("الشخص المسؤول")
+                phone = st.text_input("الهاتف")
+                whatsapp = st.text_input("WhatsApp")
+            with b:
+                email = st.text_input("الإيميل")
+                website = st.text_input("الموقع")
+                brands = st.text_input("البراندات", placeholder="Linglong, Botrian, ...")
+                terms = st.text_area("شروط الدفع")
+                notes = st.text_area("ملاحظات")
+            if st.form_submit_button("💾 حفظ الشركة", use_container_width=True):
+                if not name.strip():
+                    st.error("اسم الشركة مطلوب.")
                 else:
-                    st.error("يرجى إدخال اسم الشركة على الأقل.")
+                    execute("""INSERT INTO companies
+                        (company_name,country,city,contact_person,phone,whatsapp,email,website,brands,payment_terms,notes,created_at)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (name.strip(), country, city, contact, phone, whatsapp, email, website, brands, terms, notes, now_text()))
+                    st.success("تمت إضافة الشركة.")
+                    st.rerun()
+
+    with tab1:
+        companies = fetch_df("SELECT * FROM companies ORDER BY company_name")
+        if companies.empty:
+            st.info("لا توجد شركات بعد.")
+        else:
+            search = st.text_input("🔎 ابحث باسم الشركة أو البراند")
+            filtered = companies.copy()
+            if search:
+                mask = filtered.astype(str).apply(lambda row: row.str.contains(search, case=False, na=False).any(), axis=1)
+                filtered = filtered[mask]
+            st.dataframe(filtered[["id","company_name","contact_person","phone","email","brands","payment_terms"]], use_container_width=True, hide_index=True)
+
+            labels = {f"{r.company_name} (#{int(r.id)})": int(r.id) for r in companies.itertuples()}
+            selected_label = st.selectbox("افتح ملف شركة", list(labels.keys()))
+            cid = labels[selected_label]
+            company = fetch_df("SELECT * FROM companies WHERE id=?", (cid,)).iloc[0]
+            st.markdown(f"### 📂 ملف {company['company_name']}")
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("الطلبيات", int(fetch_df("SELECT COUNT(*) n FROM orders WHERE company_id=?", (cid,)).iloc[0,0]))
+            m2.metric("الفواتير", int(fetch_df("SELECT COUNT(*) n FROM invoices WHERE company_id=?", (cid,)).iloc[0,0]))
+            m3.metric("الشحنات", int(fetch_df("SELECT COUNT(*) n FROM shipments WHERE company_id=?", (cid,)).iloc[0,0]))
+            m4.metric("المستندات", int(fetch_df("SELECT COUNT(*) n FROM documents WHERE company_id=?", (cid,)).iloc[0,0]))
+
+            ctabs = st.tabs(["معلومات", "طلبيات", "فواتير", "شحنات", "دفعات", "حسابات بنكية", "مستندات", "أسعار"])
+            with ctabs[0]:
+                st.write({
+                    "الشخص المسؤول": company["contact_person"] or "-",
+                    "الهاتف": company["phone"] or "-",
+                    "WhatsApp": company["whatsapp"] or "-",
+                    "الإيميل": company["email"] or "-",
+                    "الموقع": company["website"] or "-",
+                    "البراندات": company["brands"] or "-",
+                    "شروط الدفع": company["payment_terms"] or "-",
+                    "ملاحظات": company["notes"] or "-",
+                })
+            with ctabs[1]:
+                st.dataframe(fetch_df("SELECT id, order_number, order_date, product_summary, quantity, total_amount, currency, paid_amount, status FROM orders WHERE company_id=? ORDER BY id DESC", (cid,)), use_container_width=True, hide_index=True)
+            with ctabs[2]:
+                st.dataframe(fetch_df("SELECT id, invoice_number, invoice_date, due_date, amount, currency, status FROM invoices WHERE company_id=? ORDER BY id DESC", (cid,)), use_container_width=True, hide_index=True)
+            with ctabs[3]:
+                st.dataframe(fetch_df("SELECT id, shipment_number, container_number, bl_number, shipping_line, loading_port, destination_port, etd, eta, status FROM shipments WHERE company_id=? ORDER BY id DESC", (cid,)), use_container_width=True, hide_index=True)
+            with ctabs[4]:
+                st.dataframe(fetch_df("SELECT id, payment_type, due_date, payment_date, amount, currency, status, reference FROM payments WHERE company_id=? ORDER BY id DESC", (cid,)), use_container_width=True, hide_index=True)
+            with ctabs[5]:
+                st.dataframe(fetch_df("SELECT id, bank_name, beneficiary_name, account_number, iban, swift, currency FROM bank_accounts WHERE company_id=? ORDER BY id DESC", (cid,)), use_container_width=True, hide_index=True)
+            with ctabs[6]:
+                docs = fetch_df("SELECT id, document_type, file_name, file_path, upload_date FROM documents WHERE company_id=? ORDER BY id DESC", (cid,))
+                if docs.empty:
+                    st.info("لا توجد مستندات.")
+                else:
+                    for r in docs.itertuples():
+                        col1, col2 = st.columns([4,1])
+                        col1.write(f"📄 **{r.file_name}** — {r.document_type or 'مستند'} — {r.upload_date}")
+                        if os.path.exists(r.file_path):
+                            with open(r.file_path, "rb") as fh:
+                                col2.download_button("تنزيل", data=fh.read(), file_name=r.file_name, key=f"co_doc_{r.id}")
+            with ctabs[7]:
+                st.dataframe(fetch_df("SELECT product_name, specification, brand, quantity, unit_price, currency, incoterm, quote_date, valid_until FROM prices WHERE company_id=? ORDER BY id DESC", (cid,)), use_container_width=True, hide_index=True)
+
+# -------------------- Orders --------------------
+elif choice == "🧾 الطلبيات":
+    st.title("🧾 الطلبيات")
+    opts = company_options()
+    if not opts:
+        st.warning("أضف شركة أولاً.")
+    else:
+        with st.expander("➕ إضافة طلبية", expanded=True):
+            with st.form("add_order"):
+                c1, c2 = st.columns(2)
+                with c1:
+                    comp_label = st.selectbox("الشركة", list(opts.keys()))
+                    order_no = st.text_input("رقم الطلبية / PO")
+                    order_date = st.date_input("تاريخ الطلبية", value=date.today())
+                    product = st.text_area("المنتجات / التفاصيل")
+                    quantity = st.number_input("الكمية", min_value=0.0, step=1.0)
+                with c2:
+                    currency = st.selectbox("العملة", ["USD","RMB","EUR","AED","IQD"])
+                    total = st.number_input("إجمالي الطلبية", min_value=0.0, step=100.0)
+                    paid = st.number_input("المدفوع", min_value=0.0, step=100.0)
+                    status = st.selectbox("الحالة", ["جديدة","قيد التصنيع","جاهزة للشحن","شحن جزئي","مكتملة","ملغاة"])
+                    notes = st.text_area("ملاحظات")
+                if st.form_submit_button("💾 حفظ الطلبية"):
+                    execute("""INSERT INTO orders (company_id,order_number,order_date,product_summary,quantity,currency,total_amount,paid_amount,status,notes,created_at)
+                             VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                            (opts[comp_label], order_no, str(order_date), product, quantity, currency, total, paid, status, notes, now_text()))
+                    st.success("تم حفظ الطلبية.")
+                    st.rerun()
+
+        df = fetch_df("""SELECT o.id, c.company_name AS الشركة, o.order_number AS الطلبية, o.order_date AS التاريخ,
+                              o.product_summary AS المنتجات, o.total_amount AS الإجمالي, o.currency AS العملة,
+                              o.paid_amount AS المدفوع, (o.total_amount-o.paid_amount) AS المتبقي, o.status AS الحالة
+                       FROM orders o JOIN companies c ON c.id=o.company_id ORDER BY o.id DESC""")
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+# -------------------- Invoices --------------------
+elif choice == "💵 الفواتير":
+    st.title("💵 الفواتير")
+    opts = company_options()
+    if not opts:
+        st.warning("أضف شركة أولاً.")
+    else:
+        with st.expander("➕ إضافة فاتورة", expanded=True):
+            comp_label = st.selectbox("الشركة", list(opts.keys()), key="inv_company")
+            cid = opts[comp_label]
+            order_opts = optional_order_options(cid)
+            with st.form("add_invoice"):
+                c1, c2 = st.columns(2)
+                with c1:
+                    order_label = st.selectbox("ربط بالطلبية", list(order_opts.keys()))
+                    inv_no = st.text_input("رقم الفاتورة / PI / CI")
+                    inv_date = st.date_input("تاريخ الفاتورة", value=date.today())
+                    due = st.date_input("تاريخ الاستحقاق", value=date.today())
+                with c2:
+                    currency = st.selectbox("العملة", ["USD","RMB","EUR","AED","IQD"], key="inv_curr")
+                    amount = st.number_input("المبلغ", min_value=0.0, step=100.0)
+                    status = st.selectbox("الحالة", ["غير مدفوعة","مدفوعة جزئياً","مدفوعة","ملغاة"])
+                    notes = st.text_area("ملاحظات")
+                if st.form_submit_button("💾 حفظ الفاتورة"):
+                    execute("""INSERT INTO invoices (company_id,order_id,invoice_number,invoice_date,due_date,currency,amount,status,notes,created_at)
+                               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                            (cid, order_opts[order_label], inv_no, str(inv_date), str(due), currency, amount, status, notes, now_text()))
+                    st.success("تم حفظ الفاتورة.")
+                    st.rerun()
+
+        df = fetch_df("""SELECT i.id,c.company_name AS الشركة,i.invoice_number AS الفاتورة,o.order_number AS الطلبية,
+                              i.invoice_date AS التاريخ,i.due_date AS الاستحقاق,i.amount AS المبلغ,i.currency AS العملة,i.status AS الحالة
+                       FROM invoices i JOIN companies c ON c.id=i.company_id LEFT JOIN orders o ON o.id=i.order_id ORDER BY i.id DESC""")
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+# -------------------- Shipments --------------------
+elif choice == "🚢 الشحنات":
+    st.title("🚢 الشحنات والحاويات")
+    opts = company_options()
+    if not opts:
+        st.warning("أضف شركة أولاً.")
+    else:
+        comp_label = st.selectbox("اختر الشركة للشحنة الجديدة", list(opts.keys()), key="ship_company")
+        cid = opts[comp_label]
+        order_opts = optional_order_options(cid)
+        with st.expander("➕ إضافة شحنة", expanded=True):
+            with st.form("add_shipment"):
+                a,b = st.columns(2)
+                with a:
+                    order_label = st.selectbox("ربط بالطلبية", list(order_opts.keys()))
+                    ship_no = st.text_input("رقم الشحنة")
+                    container = st.text_input("رقم الحاوية")
+                    bl = st.text_input("رقم Bill of Lading")
+                    line = st.text_input("شركة الشحن")
+                    qty_cont = st.number_input("عدد الحاويات", min_value=1, step=1)
+                with b:
+                    loading = st.text_input("ميناء التحميل", value="China")
+                    destination = st.text_input("ميناء الوصول", value="Umm Qasr")
+                    etd = st.date_input("ETD", value=date.today())
+                    eta = st.date_input("ETA", value=date.today())
+                    status = st.selectbox("الحالة", ["في المعمل","جاهزة للشحن","بالطريق","Transshipment","وصلت الميناء","بالجمارك","تم الاستلام"])
+                    tracking = st.text_input("رابط التتبع")
+                    notes = st.text_area("ملاحظات")
+                if st.form_submit_button("💾 حفظ الشحنة"):
+                    execute("""INSERT INTO shipments (company_id,order_id,shipment_number,container_number,bl_number,shipping_line,loading_port,destination_port,etd,eta,status,quantity_containers,tracking_url,notes,created_at)
+                               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                            (cid, order_opts[order_label], ship_no, container, bl, line, loading, destination, str(etd), str(eta), status, int(qty_cont), tracking, notes, now_text()))
+                    st.success("تم حفظ الشحنة.")
+                    st.rerun()
+
+        df = fetch_df("""SELECT s.id,c.company_name AS الشركة,o.order_number AS الطلبية,s.container_number AS الحاوية,
+                              s.bl_number AS BL,s.shipping_line AS الناقل,s.loading_port AS من,s.destination_port AS إلى,
+                              s.etd AS ETD,s.eta AS ETA,s.status AS الحالة,s.quantity_containers AS الحاويات
+                       FROM shipments s JOIN companies c ON c.id=s.company_id LEFT JOIN orders o ON o.id=s.order_id ORDER BY s.id DESC""")
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+# -------------------- Payments --------------------
+elif choice == "💳 الدفعات":
+    st.title("💳 الدفعات ومواعيد الاستحقاق")
+    opts = company_options()
+    if not opts:
+        st.warning("أضف شركة أولاً.")
+    else:
+        comp_label = st.selectbox("الشركة", list(opts.keys()), key="pay_company")
+        cid = opts[comp_label]
+        order_opts = optional_order_options(cid)
+        invoice_opts = optional_invoice_options(cid)
+        bank_opts = optional_bank_options(cid)
+        with st.form("add_payment"):
+            a,b = st.columns(2)
+            with a:
+                order_label = st.selectbox("الطلبية", list(order_opts.keys()))
+                invoice_label = st.selectbox("الفاتورة", list(invoice_opts.keys()))
+                bank_label = st.selectbox("الحساب البنكي", list(bank_opts.keys()))
+                ptype = st.selectbox("نوع الدفعة", ["Advance","Balance","Deposit","Freight","Customs","Other"])
+                amount = st.number_input("المبلغ", min_value=0.0, step=100.0)
+            with b:
+                currency = st.selectbox("العملة", ["USD","RMB","EUR","AED","IQD"], key="pay_curr")
+                due = st.date_input("موعد الاستحقاق", value=date.today())
+                pdate = st.text_input("تاريخ الدفع الفعلي", placeholder="اتركه فارغاً إذا لم تُدفع")
+                status = st.selectbox("الحالة", ["مستحقة","مستحقة قريباً","مدفوعة جزئياً","مدفوعة","مؤجلة"])
+                ref = st.text_input("رقم التحويل / المرجع")
+                notes = st.text_area("ملاحظات")
+            if st.form_submit_button("💾 حفظ الدفعة"):
+                execute("""INSERT INTO payments (company_id,order_id,invoice_id,bank_account_id,payment_type,due_date,payment_date,currency,amount,status,reference,notes,created_at)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (cid, order_opts[order_label], invoice_opts[invoice_label], bank_opts[bank_label], ptype, str(due), pdate, currency, amount, status, ref, notes, now_text()))
+                st.success("تم حفظ الدفعة.")
+                st.rerun()
+
+        df = fetch_df("""SELECT p.id,c.company_name AS الشركة,p.payment_type AS النوع,p.amount AS المبلغ,p.currency AS العملة,
+                              p.due_date AS الاستحقاق,p.payment_date AS تاريخ_الدفع,p.status AS الحالة,p.reference AS المرجع
+                       FROM payments p JOIN companies c ON c.id=p.company_id ORDER BY p.id DESC""")
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+# -------------------- Bank Accounts --------------------
+elif choice == "🏦 الحسابات البنكية":
+    st.title("🏦 الحسابات البنكية للمصانع")
+    st.warning("هذه بيانات مالية حساسة. النسخة الحالية محلية؛ عند نشر البرنامج على الإنترنت استخدم تسجيل دخول قوي، تشفير، وصلاحيات مستخدمين.")
+    opts = company_options()
+    if not opts:
+        st.warning("أضف شركة أولاً.")
+    else:
+        with st.form("add_bank"):
+            a,b = st.columns(2)
+            with a:
+                comp_label = st.selectbox("الشركة", list(opts.keys()), key="bank_company")
+                bank_name = st.text_input("اسم البنك")
+                beneficiary = st.text_input("اسم المستفيد")
+                account = st.text_input("رقم الحساب")
+                iban = st.text_input("IBAN")
+            with b:
+                swift = st.text_input("SWIFT / BIC")
+                address = st.text_input("عنوان البنك")
+                currency = st.selectbox("العملة", ["USD","RMB","EUR","AED","IQD"], key="bank_curr")
+                notes = st.text_area("ملاحظات")
+            if st.form_submit_button("💾 حفظ الحساب"):
+                execute("""INSERT INTO bank_accounts (company_id,bank_name,beneficiary_name,account_number,iban,swift,bank_address,currency,notes,created_at)
+                           VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                        (opts[comp_label],bank_name,beneficiary,account,iban,swift,address,currency,notes,now_text()))
+                st.success("تم حفظ الحساب البنكي.")
+                st.rerun()
+
+        df = fetch_df("""SELECT b.id,c.company_name AS الشركة,b.bank_name AS البنك,b.beneficiary_name AS المستفيد,
+                              b.account_number AS الحساب,b.iban AS IBAN,b.swift AS SWIFT,b.currency AS العملة
+                       FROM bank_accounts b JOIN companies c ON c.id=b.company_id ORDER BY b.id DESC""")
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+# -------------------- Documents --------------------
+elif choice == "📁 المستندات الأصلية":
+    st.title("📁 المستندات الأصلية PDF والصور")
+    opts = company_options()
+    if not opts:
+        st.warning("أضف شركة أولاً.")
+    else:
+        comp_label = st.selectbox("الشركة", list(opts.keys()), key="doc_company")
+        cid = opts[comp_label]
+        order_opts = optional_order_options(cid)
+        invoice_opts = optional_invoice_options(cid)
+        shipment_opts = optional_shipment_options(cid)
+
+        with st.form("upload_doc", clear_on_submit=True):
+            a,b = st.columns(2)
+            with a:
+                doc_type = st.selectbox("نوع المستند", ["Proforma Invoice","Commercial Invoice","Packing List","Bill of Lading","Certificate of Origin","Insurance","Contract","Bank Slip","Customs","Other"])
+                order_label = st.selectbox("ربط بطلبية", list(order_opts.keys()))
+                invoice_label = st.selectbox("ربط بفاتورة", list(invoice_opts.keys()))
+                shipment_label = st.selectbox("ربط بشحنة", list(shipment_opts.keys()))
+            with b:
+                up = st.file_uploader("اختر PDF / صورة", type=["pdf","png","jpg","jpeg"])
+                notes = st.text_area("ملاحظات")
+            if st.form_submit_button("⬆️ رفع وحفظ المستند"):
+                if up is None:
+                    st.error("اختر ملفاً أولاً.")
+                else:
+                    path = save_uploaded_file(up, cid)
+                    execute("""INSERT INTO documents (company_id,order_id,shipment_id,invoice_id,document_type,file_name,file_path,upload_date,notes)
+                               VALUES (?,?,?,?,?,?,?,?,?)""",
+                            (cid, order_opts[order_label], shipment_opts[shipment_label], invoice_opts[invoice_label], doc_type, up.name, path, now_text(), notes))
+                    st.success("تم حفظ المستند وربطه بالملف الصحيح.")
+                    st.rerun()
+
+        docs = fetch_df("""SELECT d.id,c.company_name AS الشركة,d.document_type AS النوع,d.file_name AS الملف,
+                                o.order_number AS الطلبية,s.container_number AS الحاوية,i.invoice_number AS الفاتورة,
+                                d.file_path,d.upload_date AS تاريخ_الرفع
+                         FROM documents d JOIN companies c ON c.id=d.company_id
+                         LEFT JOIN orders o ON o.id=d.order_id LEFT JOIN shipments s ON s.id=d.shipment_id
+                         LEFT JOIN invoices i ON i.id=d.invoice_id ORDER BY d.id DESC""")
+        if docs.empty:
+            st.info("لا توجد مستندات بعد.")
+        else:
+            st.dataframe(docs.drop(columns=["file_path"]), use_container_width=True, hide_index=True)
+            st.markdown("### تنزيل مستند")
+            doc_map = {f"#{int(r.id)} - {r.الملف} - {r.الشركة}": r for r in docs.itertuples()}
+            pick = st.selectbox("المستند", list(doc_map.keys()))
+            row = doc_map[pick]
+            if os.path.exists(row.file_path):
+                with open(row.file_path, "rb") as fh:
+                    st.download_button("⬇️ تنزيل الملف الأصلي", data=fh.read(), file_name=row.الملف)
+            else:
+                st.error("الملف غير موجود في مساره المحلي.")
+
+# -------------------- Prices --------------------
+elif choice == "📈 مقارنة الأسعار":
+    st.title("📈 مقارنة أسعار المصانع والوكالات")
+    opts = company_options()
+    if not opts:
+        st.warning("أضف شركة أولاً.")
+    else:
+        with st.form("add_price"):
+            a,b = st.columns(2)
+            with a:
+                comp_label = st.selectbox("المصنع / الشركة", list(opts.keys()), key="price_company")
+                product = st.text_input("المنتج / القياس *", placeholder="مثال: 12R22.5")
+                spec = st.text_input("المواصفة / Pattern")
+                brand = st.text_input("البراند")
+                qty = st.number_input("الكمية", min_value=0.0, step=1.0)
+            with b:
+                unit_price = st.number_input("سعر الوحدة", min_value=0.0, step=0.01)
+                currency = st.selectbox("العملة", ["USD","RMB","EUR"], key="price_curr")
+                incoterm = st.selectbox("Incoterm", ["EXW","FOB","CFR","CIF","DAP","DDP","Other"])
+                quote_date = st.date_input("تاريخ العرض", value=date.today())
+                valid_until = st.text_input("صالح لغاية")
+                notes = st.text_area("ملاحظات")
+            if st.form_submit_button("💾 حفظ عرض السعر"):
+                if not product.strip():
+                    st.error("اسم المنتج أو القياس مطلوب.")
+                else:
+                    execute("""INSERT INTO prices (company_id,product_name,specification,brand,quantity,unit_price,currency,incoterm,quote_date,valid_until,notes,created_at)
+                               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                            (opts[comp_label],product,spec,brand,qty,unit_price,currency,incoterm,str(quote_date),valid_until,notes,now_text()))
+                    st.success("تم حفظ السعر.")
+                    st.rerun()
+
+        prices = fetch_df("""SELECT p.id,c.company_name AS الشركة,p.product_name AS المنتج,p.specification AS المواصفة,
+                                  p.brand AS البراند,p.quantity AS الكمية,p.unit_price AS السعر,p.currency AS العملة,
+                                  p.incoterm AS Incoterm,p.quote_date AS التاريخ,p.valid_until AS الصلاحية
+                           FROM prices p JOIN companies c ON c.id=p.company_id ORDER BY p.id DESC""")
+        if prices.empty:
+            st.info("لا توجد عروض أسعار بعد.")
+        else:
+            st.dataframe(prices, use_container_width=True, hide_index=True)
+            products = sorted([x for x in prices["المنتج"].dropna().unique() if str(x).strip()])
+            if products:
+                selected_product = st.selectbox("قارن منتجاً", products)
+                comp = prices[prices["المنتج"] == selected_product].copy().sort_values("السعر")
+                st.subheader(f"أفضل الأسعار لـ {selected_product}")
+                st.dataframe(comp, use_container_width=True, hide_index=True)
+                if not comp.empty:
+                    best = comp.iloc[0]
+                    st.success(f"أفضل سعر مسجل: {best['الشركة']} — {best['السعر']:,.2f} {best['العملة']} ({best['Incoterm']})")
+                    chart_df = comp[["الشركة","السعر"]].set_index("الشركة")
+                    st.bar_chart(chart_df)
+
+# -------------------- Agencies --------------------
+elif choice == "🤝 الوكالات":
+    st.title("🤝 الوكالات والبراندات")
+    opts = company_options()
+    opts_with_none = {"بدون ربط بمصنع": None, **opts}
+    with st.form("add_agency"):
+        a,b = st.columns(2)
+        with a:
+            comp_label = st.selectbox("المصنع المرتبط", list(opts_with_none.keys()))
+            brand = st.text_input("اسم البراند / الوكالة *")
+            holder = st.text_input("صاحب الوكالة / الشركة")
+            territory = st.text_input("المنطقة", value="Iraq")
+        with b:
+            exclusivity = st.selectbox("نوع الوكالة", ["حصرية","غير حصرية","قيد التفاوض","منتهية"])
+            start = st.text_input("بداية الوكالة")
+            end = st.text_input("نهاية الوكالة")
+            notes = st.text_area("ملاحظات")
+        if st.form_submit_button("💾 حفظ الوكالة"):
+            if not brand.strip():
+                st.error("اسم البراند مطلوب.")
+            else:
+                execute("""INSERT INTO agencies (company_id,brand_name,agency_holder,territory,exclusivity,start_date,end_date,notes,created_at)
+                           VALUES (?,?,?,?,?,?,?,?,?)""",
+                        (opts_with_none[comp_label],brand,holder,territory,exclusivity,start,end,notes,now_text()))
+                st.success("تم حفظ الوكالة.")
+                st.rerun()
+    df = fetch_df("""SELECT a.id,COALESCE(c.company_name,'-') AS المصنع,a.brand_name AS البراند,a.agency_holder AS صاحب_الوكالة,
+                          a.territory AS المنطقة,a.exclusivity AS النوع,a.start_date AS البداية,a.end_date AS النهاية,a.notes AS ملاحظات
+                   FROM agencies a LEFT JOIN companies c ON c.id=a.company_id ORDER BY a.id DESC""")
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+# -------------------- Tasks --------------------
+elif choice == "📝 المتابعة والمهام":
+    st.title("📝 المتابعة والمهام")
+    opts = {"عام": None, **company_options()}
+    with st.form("add_task"):
+        a,b = st.columns(2)
+        with a:
+            comp_label = st.selectbox("الشركة", list(opts.keys()))
+            title = st.text_input("المهمة *", placeholder="مثال: متابعة أوراق BL الأصلية")
+            details = st.text_area("التفاصيل")
+        with b:
+            due = st.date_input("موعد المتابعة", value=date.today())
+            priority = st.selectbox("الأولوية", ["عالية","متوسطة","منخفضة"])
+            status = st.selectbox("الحالة", ["مفتوحة","قيد المتابعة","مكتملة"])
+        if st.form_submit_button("💾 حفظ المهمة"):
+            if not title.strip():
+                st.error("عنوان المهمة مطلوب.")
+            else:
+                execute("INSERT INTO notes_tasks (company_id,title,details,due_date,priority,status,created_at) VALUES (?,?,?,?,?,?,?)",
+                        (opts[comp_label],title,details,str(due),priority,status,now_text()))
+                st.success("تم حفظ المهمة.")
+                st.rerun()
+    df = fetch_df("""SELECT n.id,COALESCE(c.company_name,'عام') AS الشركة,n.title AS المهمة,n.details AS التفاصيل,
+                          n.due_date AS الموعد,n.priority AS الأولوية,n.status AS الحالة
+                   FROM notes_tasks n LEFT JOIN companies c ON c.id=n.company_id ORDER BY n.id DESC""")
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+# -------------------- MIDO AI --------------------
+elif choice == "🤖 ميدو AI":
+    st.title("🤖 ميدو AI")
+    st.info("هذه النسخة تعمل كمساعد بحث ذكي داخل قاعدة البيانات. ربط نموذج AI خارجي لاحقاً سيجعل ميدو يفهم الرسائل الحرة ويحوّلها تلقائياً إلى شركات وطلبيات وشحنات وفواتير.")
+
+    q = st.text_input("اكتب سؤالك لميدو", placeholder="مثال: شنو الشحنات بالطريق؟ / دفعات Linglong / أسعار 12R22.5")
+    if st.button("اسأل ميدو", type="primary") and q.strip():
+        ql = q.lower()
+        if any(k in ql for k in ["شحن", "حاوي", "بالطريق", "eta"]):
+            df = fetch_df("""SELECT c.company_name AS الشركة,s.container_number AS الحاوية,s.bl_number AS BL,
+                                  s.destination_port AS الوجهة,s.eta AS ETA,s.status AS الحالة
+                           FROM shipments s JOIN companies c ON c.id=s.company_id ORDER BY s.eta ASC""")
+            st.write(f"وجدت {len(df)} شحنة مسجلة:")
+            st.dataframe(df, use_container_width=True, hide_index=True)
+        elif any(k in ql for k in ["دفع", "دفعة", "مستحق"]):
+            df = fetch_df("""SELECT c.company_name AS الشركة,p.payment_type AS النوع,p.amount AS المبلغ,p.currency AS العملة,
+                                  p.due_date AS الاستحقاق,p.status AS الحالة
+                           FROM payments p JOIN companies c ON c.id=p.company_id
+                           WHERE p.status NOT IN ('مدفوعة','تم الدفع') ORDER BY p.due_date ASC""")
+            st.write(f"عندك {len(df)} دفعة غير مدفوعة:")
+            st.dataframe(df, use_container_width=True, hide_index=True)
+        elif any(k in ql for k in ["سعر", "اسعار", "أسعار", "قارن", "مقارنة"]):
+            df = fetch_df("""SELECT c.company_name AS الشركة,p.product_name AS المنتج,p.specification AS المواصفة,
+                                  p.unit_price AS السعر,p.currency AS العملة,p.incoterm AS Incoterm,p.quote_date AS التاريخ
+                           FROM prices p JOIN companies c ON c.id=p.company_id ORDER BY p.product_name,p.unit_price ASC""")
+            st.dataframe(df, use_container_width=True, hide_index=True)
+        elif any(k in ql for k in ["شركة", "مصنع", "معمل", "مورد"]):
+            df = fetch_df("SELECT id,company_name AS الشركة,contact_person AS المسؤول,phone AS الهاتف,email AS الإيميل,brands AS البراندات,payment_terms AS شروط_الدفع FROM companies ORDER BY company_name")
+            st.dataframe(df, use_container_width=True, hide_index=True)
+        elif any(k in ql for k in ["طلب", "طلبية"]):
+            df = fetch_df("""SELECT c.company_name AS الشركة,o.order_number AS الطلبية,o.product_summary AS المنتجات,
+                                  o.total_amount AS الإجمالي,o.currency AS العملة,o.paid_amount AS المدفوع,o.status AS الحالة
+                           FROM orders o JOIN companies c ON c.id=o.company_id ORDER BY o.id DESC""")
+            st.dataframe(df, use_container_width=True, hide_index=True)
+        else:
+            # General database search across main business text fields
+            term = f"%{q}%"
+            comp = fetch_df("SELECT id,company_name,contact_person,email,brands,notes FROM companies WHERE company_name LIKE ? OR contact_person LIKE ? OR brands LIKE ? OR notes LIKE ?", (term,term,term,term))
+            orders = fetch_df("SELECT id,order_number,product_summary,status,notes FROM orders WHERE order_number LIKE ? OR product_summary LIKE ? OR notes LIKE ?", (term,term,term))
+            shipments = fetch_df("SELECT id,container_number,bl_number,status,notes FROM shipments WHERE container_number LIKE ? OR bl_number LIKE ? OR notes LIKE ?", (term,term,term))
+            if comp.empty and orders.empty and shipments.empty:
+                st.warning("ما لقيت نتيجة مباشرة. جرّب اسم شركة، رقم حاوية، BL، منتج، أو كلمة من الملاحظات.")
+            else:
+                if not comp.empty:
+                    st.subheader("شركات")
+                    st.dataframe(comp, use_container_width=True, hide_index=True)
+                if not orders.empty:
+                    st.subheader("طلبيات")
+                    st.dataframe(orders, use_container_width=True, hide_index=True)
+                if not shipments.empty:
+                    st.subheader("شحنات")
+                    st.dataframe(shipments, use_container_width=True, hide_index=True)
 
     st.markdown("---")
-    st.subheader("📋 قائمة الحسابات والشركات الصينية")
-    conn = sqlite3.connect(DB_NAME)
-    df = pd.read_sql_query("SELECT id, company_name, bank_account, order_details, payment_date, shipment_status, unit_price, total_amount FROM suppliers", conn)
-    conn.close()
-    
-    if not df.empty:
-        st.dataframe(df, use_container_width=True)
-    else:
-        st.info("السجل فارغ حتى الآن.")
+    st.subheader("المرحلة القادمة: AI حقيقي")
+    st.markdown("""
+    عندما نربط API لنموذج ذكاء اصطناعي، ستقدر تكتب مثلاً:
 
-# --- القسم الثالث: دروب بوكس المستندات ---
-elif choice == "📁 دروب بوكس المستندات (PDF)":
-    st.title("📁 دروب بوكس ميدو - أرشيف المستندات والملفات الأصلية")
-    
-    conn = sqlite3.connect(DB_NAME)
-    suppliers_df = pd.read_sql_query("SELECT id, company_name FROM suppliers", conn)
-    conn.close()
-    
-    if not suppliers_df.empty:
-        col_up, col_list = st.columns([1, 1])
-        with col_up:
-            st.subheader("رفع مستند جديد")
-            selected_company = st.selectbox("اختر الشركة الصينية", suppliers_df["company_name"].tolist())
-            uploaded_file = st.file_uploader("اختر ملف الفاتورة أو البوليصة (PDF / PNG / JPG)", type=["pdf", "png", "jpg", "jpeg"])
-            
-            if uploaded_file is not None:
-                file_path = os.path.join(UPLOAD_DIR, uploaded_file.name)
-                with open(file_path, "wb") as f:
-                    f.write(uploaded_file.getbuffer())
-                
-                comp_id = suppliers_df[suppliers_df["company_name"] == selected_company]["id"].values[0]
-                conn = sqlite3.connect(DB_NAME)
-                c = conn.cursor()
-                c.execute("INSERT INTO documents (company_id, file_name, file_path, upload_date) VALUES (?,?,?,?)", 
-                          (int(comp_id), uploaded_file.name, file_path, str(datetime.now().strftime("%Y-%m-%d %H:%M"))))
-                conn.commit()
-                conn.close()
-                st.success(f"تم حفظ الملف ({uploaded_file.name}) في السحابة بنجاح!")
-        
-        with col_list:
-            st.subheader("📚 الملفات المخزنة بالدروب بوكس")
-            conn = sqlite3.connect(DB_NAME)
-            docs_df = pd.read_sql_query("""
-                SELECT d.id, s.company_name, d.file_name, d.upload_date 
-                FROM documents d 
-                JOIN suppliers s ON d.company_id = s.id
-            """, conn)
-            conn.close()
-            
-            if not docs_df.empty:
-                st.dataframe(docs_df, use_container_width=True)
-            else:
-                st.info("لا توجد ملفات مرفوعة بعد.")
-    else:
-        st.warning("يرجى إضافة شركات صينية في القسم السابق لتتمكن من رفع المستندات لها.")
+    **Linglong عندهم طلبية 4 حاويات، PI رقم LL-258 قيمتها 85,000 دولار، دفعنا 30%، ETA أم قصر 15 سبتمبر.**
 
-# --- القسم الرابع: مقارنة الأسعار ---
-elif choice == "📈 مقارنة أسعار المعامل":
-    st.title("📈 مقارنة أسعار المعامل والوكالات")
-    
-    conn = sqlite3.connect(DB_NAME)
-    df = pd.read_sql_query("SELECT company_name, unit_price, order_details FROM suppliers WHERE unit_price > 0", conn)
-    conn.close()
-    
-    if not df.empty:
-        st.subheader("مقارنة سعر القطعة بين المعامل ($)")
-        st.bar_chart(data=df.set_index("company_name")["unit_price"])
-        st.markdown("---")
-        st.subheader("ترتيب المصانع من الأقل سعراً للقطعة")
-        st.table(df.sort_values(by="unit_price"))
-    else:
-        st.info("أدخل أسعار قطع المنتجات في قسم الشركات لعرض رسم بياني بمقارنة الأسعار هنا.")
-
-# --- القسم الخامس: المساعد الصوتي والاتصالات ---
-elif choice == "📞 مركز الاتصالات الذكي (AI)":
-    st.title("📞 المساعد الصوتي الآلي والاتصالات")
-    st.info("💡 هذا القسم مخصص لإعطاء أمر للذكاء الاصطناعي ليقوم بالاتصال الهاتفي بالمصانع والعملاء ومتابعة الحاويات نيابة عنك.")
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        phone = st.text_input("رقم الهاتف الدولي المراد الاتصال به", value="+86")
-        language = st.selectbox("لغة المكالمة", ["الصينية (Mandarin)", "الإنكليزية (English)", "العربية"])
-    with col2:
-        task = st.text_area("تعليمات المكالمة للمساعد الذكي", "اتصل بالمصنع واستفسر عن سبب تأخير شحن الحاوية وموعد إرسال أوراق الشحن الأصلية.")
-    
-    if st.button("🚀 بدء الاتصال الهاتفي الذكي الآن"):
-        st.success(f"جاري تحضير الاتصال برقم {phone} باللغة ({language})...")
-        st.caption("ملاحظة: تفعيل الاتصال الهاتفي الفعلي يرتبط بشرائح الاتصال السحابية مثل (Bland AI / Twilio API).")
+    وميدو سيحوّلها تلقائياً إلى: شركة + طلبية + فاتورة + دفعة + شحنة + موعد متابعة، ثم يطلب منك التأكيد قبل الحفظ.
+    """)
