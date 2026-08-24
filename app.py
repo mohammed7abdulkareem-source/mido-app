@@ -136,6 +136,10 @@ st.markdown(
 )
 
 # -------------------- Database --------------------
+def now_text():
+    return datetime.now().strftime("%Y-%m-%d %H:%M")
+
+
 def get_conn():
     conn = sqlite3.connect(DB_NAME, check_same_thread=False)
     conn.row_factory = sqlite3.Row
@@ -498,10 +502,6 @@ def init_db():
 init_db()
 
 
-def now_text():
-    return datetime.now().strftime("%Y-%m-%d %H:%M")
-
-
 def fetch_df(sql, params=()):
     conn = get_conn()
     try:
@@ -610,7 +610,7 @@ def money(v, currency="USD"):
 
 # -------------------- Sidebar --------------------
 st.sidebar.title("🤖 MIDO")
-st.sidebar.caption("مساعد محمد التجاري — v4")
+st.sidebar.caption("مساعد محمد التجاري — v4.2")
 st.sidebar.markdown("---")
 menu = [
     "📊 لوحة التحكم",
@@ -631,7 +631,7 @@ st.sidebar.markdown("---")
 if dropbox_ready():
     st.sidebar.success("☁️ Dropbox مربوط — الملفات الأصلية والنسخة الاحتياطية تُحفظ في MIDO")
 else:
-    st.sidebar.warning("⚠️ Dropbox غير مربوط — أضف مفاتيح Dropbox في Streamlit Secrets")
+    st.sidebar.warning("ℹ️ Dropbox غير مربوط بعد — البرنامج يعمل بشكل طبيعي، والربط السحابي نفعّله لاحقاً")
 
 # -------------------- Dashboard --------------------
 if choice == "📊 لوحة التحكم":
@@ -755,16 +755,45 @@ elif choice == "🏭 الشركات الصينية":
 
             ctabs = st.tabs(["معلومات", "طلبيات", "فواتير", "شحنات", "دفعات", "حسابات بنكية", "مستندات", "أسعار"])
             with ctabs[0]:
-                st.write({
-                    "الشخص المسؤول": company["contact_person"] or "-",
-                    "الهاتف": company["phone"] or "-",
-                    "WhatsApp": company["whatsapp"] or "-",
-                    "الإيميل": company["email"] or "-",
-                    "الموقع": company["website"] or "-",
-                    "البراندات": company["brands"] or "-",
-                    "شروط الدفع": company["payment_terms"] or "-",
-                    "ملاحظات": company["notes"] or "-",
-                })
+                st.markdown("#### ✏️ تعديل بيانات الشركة")
+                with st.form(f"edit_company_{cid}"):
+                    e1, e2 = st.columns(2)
+                    with e1:
+                        e_name = st.text_input("اسم الشركة / المصنع *", value=company["company_name"] or "")
+                        e_country = st.text_input("الدولة", value=company["country"] or "China")
+                        e_city = st.text_input("المدينة", value=company["city"] or "")
+                        e_contact = st.text_input("الشخص المسؤول", value=company["contact_person"] or "")
+                        e_phone = st.text_input("الهاتف", value=company["phone"] or "")
+                        e_whatsapp = st.text_input("WhatsApp", value=company["whatsapp"] or "")
+                    with e2:
+                        e_email = st.text_input("الإيميل", value=company["email"] or "")
+                        e_website = st.text_input("الموقع", value=company["website"] or "")
+                        e_brands = st.text_input("البراندات", value=company["brands"] or "")
+                        e_terms = st.text_area("شروط الدفع", value=company["payment_terms"] or "")
+                        e_notes = st.text_area("ملاحظات", value=company["notes"] or "")
+
+                    if st.form_submit_button("💾 حفظ التعديلات", use_container_width=True):
+                        if not e_name.strip():
+                            st.error("اسم الشركة مطلوب.")
+                        else:
+                            execute(
+                                """UPDATE companies SET company_name=?,country=?,city=?,contact_person=?,phone=?,whatsapp=?,email=?,website=?,brands=?,payment_terms=?,notes=? WHERE id=?""",
+                                (e_name.strip(), e_country, e_city, e_contact, e_phone, e_whatsapp, e_email, e_website, e_brands, e_terms, e_notes, cid),
+                            )
+                            st.success("تم تعديل بيانات الشركة بنجاح.")
+                            st.rerun()
+
+                st.markdown("---")
+                st.markdown("#### 🗑️ حذف الشركة")
+                st.caption("للحماية من الحذف بالخطأ: اكتب اسم الشركة بالضبط ثم اضغط حذف. حذف الشركة سيحذف سجلاتها المرتبطة من قاعدة MIDO، لكن ملفات Dropbox الأصلية لن تُحذف تلقائياً.")
+                confirm_name = st.text_input("اكتب اسم الشركة للتأكيد", key=f"delete_company_name_{cid}")
+                if st.button("🗑️ حذف الشركة نهائياً", key=f"delete_company_{cid}", type="secondary", use_container_width=True):
+                    if confirm_name.strip() != str(company["company_name"]).strip():
+                        st.error("اسم الشركة غير مطابق. لم يتم الحذف.")
+                    else:
+                        execute("DELETE FROM companies WHERE id=?", (cid,))
+                        st.success("تم حذف الشركة وسجلاتها المرتبطة من MIDO.")
+                        st.rerun()
             with ctabs[1]:
                 st.dataframe(fetch_df("SELECT id, order_number, order_date, product_summary, quantity, total_amount, currency, paid_amount, status FROM orders WHERE company_id=? ORDER BY id DESC", (cid,)), use_container_width=True, hide_index=True)
             with ctabs[2]:
