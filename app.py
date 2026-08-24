@@ -6,12 +6,118 @@ from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+import dropbox
+from dropbox.files import WriteMode
 
 st.set_page_config(page_title="MIDO ERP", page_icon="🤖", layout="wide", initial_sidebar_state="expanded")
 
 DB_NAME = "mido_database.db"
-UPLOAD_DIR = Path("mido_files")
+UPLOAD_DIR = Path("mido_files")  # legacy files from older MIDO versions
 UPLOAD_DIR.mkdir(exist_ok=True)
+
+# -------------------- Dropbox storage --------------------
+def _secret(name, default=""):
+    try:
+        return st.secrets.get("dropbox", {}).get(name, default)
+    except Exception:
+        return default
+
+
+def get_dropbox_client():
+    """Create a Dropbox client without exposing credentials in app.py/GitHub."""
+    app_key = _secret("app_key")
+    app_secret = _secret("app_secret")
+    refresh_token = _secret("refresh_token")
+    access_token = _secret("access_token")
+
+    if app_key and app_secret and refresh_token:
+        return dropbox.Dropbox(
+            oauth2_refresh_token=refresh_token,
+            app_key=app_key,
+            app_secret=app_secret,
+            timeout=60,
+        )
+    if access_token:
+        return dropbox.Dropbox(access_token, timeout=60)
+    return None
+
+
+def dropbox_root():
+    root = (_secret("root_folder", "/MIDO") or "/MIDO").strip()
+    if not root.startswith("/"):
+        root = "/" + root
+    return root.rstrip("/") or "/MIDO"
+
+
+def dropbox_ready():
+    return get_dropbox_client() is not None
+
+
+def safe_path_part(value):
+    value = str(value or "Unknown").strip() or "Unknown"
+    for ch in ["/", "\\", "\0"]:
+        value = value.replace(ch, "-")
+    return value[:120]
+
+
+def ensure_dropbox_folder(path):
+    dbx = get_dropbox_client()
+    if not dbx:
+        raise RuntimeError("Dropbox غير مربوط بعد. أضف مفاتيح Dropbox داخل Streamlit Secrets.")
+    try:
+        dbx.files_create_folder_v2(path)
+    except dropbox.exceptions.ApiError as e:
+        # Folder already exists is safe to ignore.
+        if "conflict" not in str(e).lower():
+            raise
+
+
+def upload_bytes_to_dropbox(data: bytes, remote_path: str):
+    dbx = get_dropbox_client()
+    if not dbx:
+        raise RuntimeError("Dropbox غير مربوط بعد.")
+    # Dropbox creates intermediate file only, so ensure parent folder exists.
+    parts = remote_path.strip("/").split("/")[:-1]
+    current = ""
+    for part in parts:
+        current += "/" + part
+        ensure_dropbox_folder(current)
+    dbx.files_upload(data, remote_path, mode=WriteMode.overwrite, mute=True)
+    return remote_path
+
+
+def download_bytes_from_dropbox(remote_path: str):
+    dbx = get_dropbox_client()
+    if not dbx:
+        raise RuntimeError("Dropbox غير مربوط بعد.")
+    _meta, response = dbx.files_download(remote_path)
+    return response.content
+
+
+def backup_database_to_dropbox():
+    """Keep the SQLite database itself backed up in Dropbox after every write."""
+    if not dropbox_ready() or not Path(DB_NAME).exists():
+        return
+    try:
+        remote = f"{dropbox_root()}/System/mido_database.db"
+        upload_bytes_to_dropbox(Path(DB_NAME).read_bytes(), remote)
+    except Exception:
+        # A document save should not crash only because backup failed.
+        pass
+
+
+def restore_database_from_dropbox_if_needed():
+    """On a fresh Streamlit instance, restore MIDO data from Dropbox if available."""
+    if Path(DB_NAME).exists() or not dropbox_ready():
+        return
+    try:
+        remote = f"{dropbox_root()}/System/mido_database.db"
+        Path(DB_NAME).write_bytes(download_bytes_from_dropbox(remote))
+    except Exception:
+        pass
+
+
+restore_database_from_dropbox_if_needed()
 
 # -------------------- Styling --------------------
 st.markdown(
@@ -35,6 +141,71 @@ def get_conn():
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
+
+
+def table_columns(conn, table_name):
+    try:
+        return {row[1] for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()}
+    except Exception:
+        return set()
+
+
+def ensure_columns(conn, table_name, columns):
+    """Add missing columns safely without deleting old data."""
+    existing = table_columns(conn, table_name)
+    for name, ddl in columns.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {name} {ddl}")
+
+
+def migrate_legacy_suppliers(conn):
+    """Import old MIDO v1 supplier records once, preserving existing information."""
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    if 'suppliers' not in tables:
+        return
+    conn.execute("CREATE TABLE IF NOT EXISTS legacy_import_map (supplier_id INTEGER PRIMARY KEY, company_id INTEGER, imported_at TEXT)")
+    rows = conn.execute("SELECT id, company_name, bank_account, order_details, payment_date, shipment_status, unit_price, total_amount FROM suppliers").fetchall()
+    for r in rows:
+        sid = r[0]
+        done = conn.execute("SELECT 1 FROM legacy_import_map WHERE supplier_id=?", (sid,)).fetchone()
+        if done:
+            continue
+        name = (r[1] or f"Legacy Company {sid}").strip()
+        existing = conn.execute("SELECT id FROM companies WHERE company_name=? ORDER BY id LIMIT 1", (name,)).fetchone()
+        if existing:
+            company_id = existing[0]
+        else:
+            cur = conn.execute("""INSERT INTO companies (company_name,country,notes,created_at) VALUES (?,?,?,?)""",
+                               (name, 'China', 'تم استيراد هذا السجل تلقائياً من نسخة MIDO القديمة.', now_text()))
+            company_id = cur.lastrowid
+        bank = r[2] or ''
+        if bank.strip():
+            conn.execute("""INSERT INTO bank_accounts (company_id,bank_name,account_number,notes,created_at) VALUES (?,?,?,?,?)""",
+                         (company_id, 'Legacy bank details', bank, 'مستورد من MIDO القديم', now_text()))
+        order_details = r[3] or ''
+        total_amount = float(r[7] or 0)
+        order_id = None
+        if order_details.strip() or total_amount:
+            cur = conn.execute("""INSERT INTO orders (company_id,order_number,order_date,product_summary,currency,total_amount,paid_amount,status,notes,created_at)
+                                  VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                               (company_id, f'LEGACY-{sid}', '', order_details, 'USD', total_amount, 0, 'مستوردة من النسخة القديمة', '', now_text()))
+            order_id = cur.lastrowid
+        pay_date = r[4] or ''
+        if pay_date:
+            conn.execute("""INSERT INTO payments (company_id,order_id,payment_type,due_date,currency,amount,status,notes,created_at)
+                              VALUES (?,?,?,?,?,?,?,?,?)""",
+                         (company_id, order_id, 'Legacy', pay_date, 'USD', total_amount, 'مستحقة', 'مستوردة من MIDO القديم', now_text()))
+        ship_status = r[5] or ''
+        if ship_status:
+            normalized = 'تم الاستلام' if ('استلام' in ship_status or 'بالكامل' in ship_status) else ship_status
+            conn.execute("""INSERT INTO shipments (company_id,order_id,shipment_number,status,received_at,notes,created_at)
+                              VALUES (?,?,?,?,?,?,?)""",
+                         (company_id, order_id, f'LEGACY-{sid}', normalized, now_text() if normalized=='تم الاستلام' else '', 'مستوردة من MIDO القديم', now_text()))
+        unit_price = float(r[6] or 0)
+        if unit_price:
+            conn.execute("""INSERT INTO prices (company_id,product_name,unit_price,currency,quote_date,notes,created_at) VALUES (?,?,?,?,?,?,?)""",
+                         (company_id, order_details[:120] or 'Legacy item', unit_price, 'USD', '', 'مستورد من MIDO القديم', now_text()))
+        conn.execute("INSERT INTO legacy_import_map (supplier_id,company_id,imported_at) VALUES (?,?,?)", (sid, company_id, now_text()))
 
 
 def init_db():
@@ -151,6 +322,7 @@ def init_db():
             status TEXT,
             quantity_containers INTEGER DEFAULT 1,
             tracking_url TEXT,
+            received_at TEXT,
             notes TEXT,
             created_at TEXT NOT NULL,
             FOREIGN KEY(company_id) REFERENCES companies(id) ON DELETE CASCADE,
@@ -226,6 +398,50 @@ def init_db():
         )
     """)
 
+    # Automatic schema migration: keeps all old data and only adds missing columns.
+    ensure_columns(conn, "companies", {
+        "country":"TEXT DEFAULT 'China'", "city":"TEXT", "contact_person":"TEXT", "phone":"TEXT",
+        "whatsapp":"TEXT", "email":"TEXT", "website":"TEXT", "brands":"TEXT", "payment_terms":"TEXT",
+        "notes":"TEXT", "created_at":"TEXT"})
+    ensure_columns(conn, "bank_accounts", {
+        "company_id":"INTEGER", "bank_name":"TEXT", "beneficiary_name":"TEXT", "account_number":"TEXT",
+        "iban":"TEXT", "swift":"TEXT", "bank_address":"TEXT", "currency":"TEXT DEFAULT 'USD'",
+        "notes":"TEXT", "created_at":"TEXT"})
+    ensure_columns(conn, "orders", {
+        "company_id":"INTEGER", "order_number":"TEXT", "order_date":"TEXT", "product_summary":"TEXT",
+        "quantity":"REAL DEFAULT 0", "currency":"TEXT DEFAULT 'USD'", "total_amount":"REAL DEFAULT 0",
+        "paid_amount":"REAL DEFAULT 0", "status":"TEXT", "notes":"TEXT", "created_at":"TEXT"})
+    ensure_columns(conn, "invoices", {
+        "company_id":"INTEGER", "order_id":"INTEGER", "invoice_number":"TEXT", "invoice_date":"TEXT",
+        "due_date":"TEXT", "currency":"TEXT DEFAULT 'USD'", "amount":"REAL DEFAULT 0", "status":"TEXT",
+        "notes":"TEXT", "created_at":"TEXT"})
+    ensure_columns(conn, "payments", {
+        "company_id":"INTEGER", "order_id":"INTEGER", "invoice_id":"INTEGER", "bank_account_id":"INTEGER",
+        "payment_type":"TEXT", "due_date":"TEXT", "payment_date":"TEXT", "currency":"TEXT DEFAULT 'USD'",
+        "amount":"REAL DEFAULT 0", "status":"TEXT", "reference":"TEXT", "notes":"TEXT", "created_at":"TEXT"})
+    ensure_columns(conn, "shipments", {
+        "company_id":"INTEGER", "order_id":"INTEGER", "shipment_number":"TEXT", "container_number":"TEXT",
+        "bl_number":"TEXT", "shipping_line":"TEXT", "loading_port":"TEXT", "destination_port":"TEXT",
+        "etd":"TEXT", "eta":"TEXT", "status":"TEXT", "quantity_containers":"INTEGER DEFAULT 1",
+        "tracking_url":"TEXT", "received_at":"TEXT", "notes":"TEXT", "created_at":"TEXT"})
+    ensure_columns(conn, "documents", {
+        "company_id":"INTEGER", "order_id":"INTEGER", "shipment_id":"INTEGER", "invoice_id":"INTEGER",
+        "document_type":"TEXT", "file_name":"TEXT", "file_path":"TEXT", "upload_date":"TEXT",
+        "notes":"TEXT", "storage_provider":"TEXT DEFAULT 'local'", "dropbox_path":"TEXT", "file_size":"INTEGER DEFAULT 0"})
+    ensure_columns(conn, "prices", {
+        "company_id":"INTEGER", "product_name":"TEXT", "specification":"TEXT", "brand":"TEXT",
+        "quantity":"REAL DEFAULT 0", "unit_price":"REAL DEFAULT 0", "currency":"TEXT DEFAULT 'USD'",
+        "incoterm":"TEXT", "quote_date":"TEXT", "valid_until":"TEXT", "notes":"TEXT", "created_at":"TEXT"})
+    ensure_columns(conn, "agencies", {
+        "company_id":"INTEGER", "brand_name":"TEXT", "agency_holder":"TEXT", "territory":"TEXT DEFAULT 'Iraq'",
+        "exclusivity":"TEXT", "start_date":"TEXT", "end_date":"TEXT", "notes":"TEXT", "created_at":"TEXT"})
+    ensure_columns(conn, "notes_tasks", {
+        "company_id":"INTEGER", "title":"TEXT", "details":"TEXT", "due_date":"TEXT", "priority":"TEXT",
+        "status":"TEXT", "created_at":"TEXT"})
+
+    conn.commit()
+    # Import records from the earliest MIDO schema once, if present.
+    migrate_legacy_suppliers(conn)
     conn.commit()
     conn.close()
 
@@ -251,9 +467,11 @@ def execute(sql, params=()):
         cur = conn.cursor()
         cur.execute(sql, params)
         conn.commit()
-        return cur.lastrowid
+        last_id = cur.lastrowid
     finally:
         conn.close()
+    backup_database_to_dropbox()
+    return last_id
 
 
 def company_options():
@@ -306,14 +524,32 @@ def optional_bank_options(company_id=None):
     return opts
 
 
-def save_uploaded_file(uploaded_file, company_id):
-    company_dir = UPLOAD_DIR / f"company_{company_id}"
-    company_dir.mkdir(parents=True, exist_ok=True)
-    safe_name = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}_{uploaded_file.name}"
-    file_path = company_dir / safe_name
-    with open(file_path, "wb") as f:
-        f.write(uploaded_file.getbuffer())
-    return str(file_path)
+def save_uploaded_file(uploaded_file, company_id, document_type="Other"):
+    """Upload the original file directly to Dropbox under MIDO/Companies/..."""
+    if not dropbox_ready():
+        raise RuntimeError("Dropbox غير مربوط. افتح إعدادات Streamlit Secrets وأضف بيانات Dropbox أولاً.")
+
+    company_df = fetch_df("SELECT company_name FROM companies WHERE id=?", (company_id,))
+    company_name = company_df.iloc[0]["company_name"] if not company_df.empty else f"Company_{company_id}"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_name = f"{timestamp}_{uuid.uuid4().hex[:8]}_{safe_path_part(uploaded_file.name)}"
+    remote_path = (
+        f"{dropbox_root()}/Companies/{safe_path_part(company_name)}/"
+        f"Documents/{safe_path_part(document_type)}/{safe_name}"
+    )
+    upload_bytes_to_dropbox(uploaded_file.getvalue(), remote_path)
+    return remote_path
+
+
+def get_document_bytes(row):
+    provider = getattr(row, "storage_provider", None) or "local"
+    dbx_path = getattr(row, "dropbox_path", None)
+    file_path = getattr(row, "file_path", None)
+    if provider == "dropbox" or dbx_path:
+        return download_bytes_from_dropbox(dbx_path or file_path)
+    if file_path and os.path.exists(file_path):
+        return Path(file_path).read_bytes()
+    raise FileNotFoundError("الملف غير موجود في التخزين.")
 
 
 def money(v, currency="USD"):
@@ -325,7 +561,7 @@ def money(v, currency="USD"):
 
 # -------------------- Sidebar --------------------
 st.sidebar.title("🤖 MIDO")
-st.sidebar.caption("مساعد محمد التجاري")
+st.sidebar.caption("مساعد محمد التجاري — v4")
 st.sidebar.markdown("---")
 menu = [
     "📊 لوحة التحكم",
@@ -343,7 +579,10 @@ menu = [
 ]
 choice = st.sidebar.radio("القسم", menu)
 st.sidebar.markdown("---")
-st.sidebar.caption("النسخة الحالية تحفظ البيانات محلياً في SQLite والملفات داخل مجلد mido_files.")
+if dropbox_ready():
+    st.sidebar.success("☁️ Dropbox مربوط — الملفات الأصلية والنسخة الاحتياطية تُحفظ في MIDO")
+else:
+    st.sidebar.warning("⚠️ Dropbox غير مربوط — أضف مفاتيح Dropbox في Streamlit Secrets")
 
 # -------------------- Dashboard --------------------
 if choice == "📊 لوحة التحكم":
@@ -352,7 +591,7 @@ if choice == "📊 لوحة التحكم":
     counts = {
         "companies": fetch_df("SELECT COUNT(*) n FROM companies").iloc[0, 0],
         "orders": fetch_df("SELECT COUNT(*) n FROM orders").iloc[0, 0],
-        "shipments": fetch_df("SELECT COUNT(*) n FROM shipments WHERE status NOT LIKE '%استلام%' AND status NOT LIKE '%وصلت%'").iloc[0, 0],
+        "shipments": fetch_df("SELECT COUNT(*) n FROM shipments WHERE COALESCE(status,'') NOT LIKE '%استلام%' AND COALESCE(status,'') NOT LIKE '%مستلمة%' AND COALESCE(status,'') NOT LIKE '%Delivered%' AND COALESCE(status,'') NOT LIKE '%مغلقة%'").iloc[0, 0],
         "docs": fetch_df("SELECT COUNT(*) n FROM documents").iloc[0, 0],
     }
     unpaid = fetch_df("SELECT COALESCE(SUM(amount),0) total FROM payments WHERE status NOT IN ('مدفوعة','تم الدفع')").iloc[0, 0]
@@ -372,6 +611,10 @@ if choice == "📊 لوحة التحكم":
             SELECT s.id, c.company_name AS الشركة, s.container_number AS الحاوية,
                    s.bl_number AS BL, s.destination_port AS الوجهة, s.eta AS ETA, s.status AS الحالة
             FROM shipments s JOIN companies c ON c.id=s.company_id
+            WHERE COALESCE(s.status,'') NOT LIKE '%استلام%'
+              AND COALESCE(s.status,'') NOT LIKE '%مستلمة%'
+              AND COALESCE(s.status,'') NOT LIKE '%Delivered%'
+              AND COALESCE(s.status,'') NOT LIKE '%مغلقة%'
             ORDER BY CASE WHEN s.eta IS NULL OR s.eta='' THEN 1 ELSE 0 END, s.eta ASC LIMIT 10
         """)
         if shp.empty:
@@ -484,16 +727,18 @@ elif choice == "🏭 الشركات الصينية":
             with ctabs[5]:
                 st.dataframe(fetch_df("SELECT id, bank_name, beneficiary_name, account_number, iban, swift, currency FROM bank_accounts WHERE company_id=? ORDER BY id DESC", (cid,)), use_container_width=True, hide_index=True)
             with ctabs[6]:
-                docs = fetch_df("SELECT id, document_type, file_name, file_path, upload_date FROM documents WHERE company_id=? ORDER BY id DESC", (cid,))
+                docs = fetch_df("SELECT id, document_type, file_name, file_path, storage_provider, dropbox_path, upload_date FROM documents WHERE company_id=? ORDER BY id DESC", (cid,))
                 if docs.empty:
                     st.info("لا توجد مستندات.")
                 else:
                     for r in docs.itertuples():
                         col1, col2 = st.columns([4,1])
                         col1.write(f"📄 **{r.file_name}** — {r.document_type or 'مستند'} — {r.upload_date}")
-                        if os.path.exists(r.file_path):
-                            with open(r.file_path, "rb") as fh:
-                                col2.download_button("تنزيل", data=fh.read(), file_name=r.file_name, key=f"co_doc_{r.id}")
+                        try:
+                            data = get_document_bytes(r)
+                            col2.download_button("تنزيل", data=data, file_name=r.file_name, key=f"co_doc_{r.id}")
+                        except Exception as e:
+                            col2.caption("غير متاح")
             with ctabs[7]:
                 st.dataframe(fetch_df("SELECT product_name, specification, brand, quantity, unit_price, currency, incoterm, quote_date, valid_until FROM prices WHERE company_id=? ORDER BY id DESC", (cid,)), use_container_width=True, hide_index=True)
 
@@ -596,17 +841,61 @@ elif choice == "🚢 الشحنات":
                     tracking = st.text_input("رابط التتبع")
                     notes = st.text_area("ملاحظات")
                 if st.form_submit_button("💾 حفظ الشحنة"):
-                    execute("""INSERT INTO shipments (company_id,order_id,shipment_number,container_number,bl_number,shipping_line,loading_port,destination_port,etd,eta,status,quantity_containers,tracking_url,notes,created_at)
-                               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                            (cid, order_opts[order_label], ship_no, container, bl, line, loading, destination, str(etd), str(eta), status, int(qty_cont), tracking, notes, now_text()))
+                    received_at = now_text() if status == "تم الاستلام" else ""
+                    execute("""INSERT INTO shipments (company_id,order_id,shipment_number,container_number,bl_number,shipping_line,loading_port,destination_port,etd,eta,status,quantity_containers,tracking_url,received_at,notes,created_at)
+                               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                            (cid, order_opts[order_label], ship_no, container, bl, line, loading, destination, str(etd), str(eta), status, int(qty_cont), tracking, received_at, notes, now_text()))
                     st.success("تم حفظ الشحنة.")
                     st.rerun()
 
-        df = fetch_df("""SELECT s.id,c.company_name AS الشركة,o.order_number AS الطلبية,s.container_number AS الحاوية,
-                              s.bl_number AS BL,s.shipping_line AS الناقل,s.loading_port AS من,s.destination_port AS إلى,
-                              s.etd AS ETD,s.eta AS ETA,s.status AS الحالة,s.quantity_containers AS الحاويات
-                       FROM shipments s JOIN companies c ON c.id=s.company_id LEFT JOIN orders o ON o.id=s.order_id ORDER BY s.id DESC""")
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.markdown("### تحديث حالة شحنة")
+        ship_manage = fetch_df("""SELECT s.id,c.company_name AS company_name,s.container_number,s.bl_number,s.status,s.received_at
+                                  FROM shipments s JOIN companies c ON c.id=s.company_id ORDER BY s.id DESC""")
+        if not ship_manage.empty:
+            labels = {f"#{int(r.id)} — {r.company_name} — {r.container_number or r.bl_number or 'شحنة'} — {r.status or '-'}": int(r.id) for r in ship_manage.itertuples()}
+            pick = st.selectbox("اختر الشحنة", list(labels.keys()), key="ship_status_pick")
+            selected_id = labels[pick]
+            current = ship_manage[ship_manage["id"] == selected_id].iloc[0]
+            statuses = ["في المعمل","جاهزة للشحن","بالطريق","Transshipment","وصلت الميناء","بالجمارك","تم الاستلام","مغلقة"]
+            current_status = current["status"] if current["status"] in statuses else "بالطريق"
+            new_status = st.selectbox("الحالة الجديدة", statuses, index=statuses.index(current_status), key="ship_status_new")
+            if st.button("💾 تحديث حالة الشحنة", type="primary"):
+                received_at = current["received_at"] or ""
+                if new_status == "تم الاستلام" and not received_at:
+                    received_at = now_text()
+                if new_status != "تم الاستلام" and current["status"] == "تم الاستلام":
+                    received_at = ""
+                execute("UPDATE shipments SET status=?, received_at=? WHERE id=?", (new_status, received_at, selected_id))
+                st.success("تم تحديث الحالة. إذا كانت الشحنة مستلمة فلن تظهر ضمن الشحنات المهمة أو بالطريق.")
+                st.rerun()
+
+        active_tab, received_tab = st.tabs(["🚢 الشحنات النشطة", "✅ الشحنات المستلمة / الأرشيف"])
+        with active_tab:
+            df = fetch_df("""SELECT s.id,c.company_name AS الشركة,o.order_number AS الطلبية,s.container_number AS الحاوية,
+                                  s.bl_number AS BL,s.shipping_line AS الناقل,s.loading_port AS من,s.destination_port AS إلى,
+                                  s.etd AS ETD,s.eta AS ETA,s.status AS الحالة,s.quantity_containers AS الحاويات
+                           FROM shipments s JOIN companies c ON c.id=s.company_id LEFT JOIN orders o ON o.id=s.order_id
+                           WHERE COALESCE(s.status,'') NOT LIKE '%استلام%'
+                             AND COALESCE(s.status,'') NOT LIKE '%مستلمة%'
+                             AND COALESCE(s.status,'') NOT LIKE '%Delivered%'
+                             AND COALESCE(s.status,'') NOT LIKE '%مغلقة%'
+                           ORDER BY CASE WHEN s.eta IS NULL OR s.eta='' THEN 1 ELSE 0 END, s.eta ASC, s.id DESC""")
+            if df.empty:
+                st.success("لا توجد شحنات نشطة حالياً.")
+            else:
+                st.dataframe(df, use_container_width=True, hide_index=True)
+        with received_tab:
+            received = fetch_df("""SELECT s.id,c.company_name AS الشركة,o.order_number AS الطلبية,s.container_number AS الحاوية,
+                                        s.bl_number AS BL,s.destination_port AS الوجهة,s.eta AS ETA,s.status AS الحالة,
+                                        s.received_at AS تاريخ_الاستلام
+                                 FROM shipments s JOIN companies c ON c.id=s.company_id LEFT JOIN orders o ON o.id=s.order_id
+                                 WHERE COALESCE(s.status,'') LIKE '%استلام%' OR COALESCE(s.status,'') LIKE '%مستلمة%'
+                                    OR COALESCE(s.status,'') LIKE '%Delivered%' OR COALESCE(s.status,'') LIKE '%مغلقة%'
+                                 ORDER BY s.id DESC""")
+            if received.empty:
+                st.info("لا توجد شحنات مستلمة في الأرشيف بعد.")
+            else:
+                st.dataframe(received, use_container_width=True, hide_index=True)
 
 # -------------------- Payments --------------------
 elif choice == "💳 الدفعات":
@@ -707,32 +996,40 @@ elif choice == "📁 المستندات الأصلية":
                 if up is None:
                     st.error("اختر ملفاً أولاً.")
                 else:
-                    path = save_uploaded_file(up, cid)
-                    execute("""INSERT INTO documents (company_id,order_id,shipment_id,invoice_id,document_type,file_name,file_path,upload_date,notes)
-                               VALUES (?,?,?,?,?,?,?,?,?)""",
-                            (cid, order_opts[order_label], shipment_opts[shipment_label], invoice_opts[invoice_label], doc_type, up.name, path, now_text(), notes))
-                    st.success("تم حفظ المستند وربطه بالملف الصحيح.")
-                    st.rerun()
+                    try:
+                        path = save_uploaded_file(up, cid, doc_type)
+                        execute("""INSERT INTO documents
+                            (company_id,order_id,shipment_id,invoice_id,document_type,file_name,file_path,upload_date,notes,storage_provider,dropbox_path,file_size)
+                            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                            (cid, order_opts[order_label], shipment_opts[shipment_label], invoice_opts[invoice_label],
+                             doc_type, up.name, path, now_text(), notes, "dropbox", path, len(up.getvalue())))
+                        st.success("✅ تم رفع النسخة الأصلية مباشرة إلى Dropbox داخل مجلد MIDO وربطها بالسجل.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"تعذر رفع الملف إلى Dropbox: {e}")
 
         docs = fetch_df("""SELECT d.id,c.company_name AS الشركة,d.document_type AS النوع,d.file_name AS الملف,
                                 o.order_number AS الطلبية,s.container_number AS الحاوية,i.invoice_number AS الفاتورة,
-                                d.file_path,d.upload_date AS تاريخ_الرفع
+                                d.file_path,d.storage_provider,d.dropbox_path,d.file_size,d.upload_date AS تاريخ_الرفع
                          FROM documents d JOIN companies c ON c.id=d.company_id
                          LEFT JOIN orders o ON o.id=d.order_id LEFT JOIN shipments s ON s.id=d.shipment_id
                          LEFT JOIN invoices i ON i.id=d.invoice_id ORDER BY d.id DESC""")
         if docs.empty:
             st.info("لا توجد مستندات بعد.")
         else:
-            st.dataframe(docs.drop(columns=["file_path"]), use_container_width=True, hide_index=True)
+            hidden_cols = [c for c in ["file_path","dropbox_path"] if c in docs.columns]
+            st.dataframe(docs.drop(columns=hidden_cols), use_container_width=True, hide_index=True)
             st.markdown("### تنزيل مستند")
             doc_map = {f"#{int(r.id)} - {r.الملف} - {r.الشركة}": r for r in docs.itertuples()}
             pick = st.selectbox("المستند", list(doc_map.keys()))
             row = doc_map[pick]
-            if os.path.exists(row.file_path):
-                with open(row.file_path, "rb") as fh:
-                    st.download_button("⬇️ تنزيل الملف الأصلي", data=fh.read(), file_name=row.الملف)
-            else:
-                st.error("الملف غير موجود في مساره المحلي.")
+            try:
+                original = get_document_bytes(row)
+                st.download_button("⬇️ تنزيل النسخة الأصلية من Dropbox", data=original, file_name=row.الملف)
+                if getattr(row, "dropbox_path", None):
+                    st.caption(f"☁️ محفوظ في Dropbox: {row.dropbox_path}")
+            except Exception as e:
+                st.error(f"تعذر جلب الملف الأصلي: {e}")
 
 # -------------------- Prices --------------------
 elif choice == "📈 مقارنة الأسعار":
@@ -855,8 +1152,13 @@ elif choice == "🤖 ميدو AI":
         if any(k in ql for k in ["شحن", "حاوي", "بالطريق", "eta"]):
             df = fetch_df("""SELECT c.company_name AS الشركة,s.container_number AS الحاوية,s.bl_number AS BL,
                                   s.destination_port AS الوجهة,s.eta AS ETA,s.status AS الحالة
-                           FROM shipments s JOIN companies c ON c.id=s.company_id ORDER BY s.eta ASC""")
-            st.write(f"وجدت {len(df)} شحنة مسجلة:")
+                           FROM shipments s JOIN companies c ON c.id=s.company_id
+                           WHERE COALESCE(s.status,'') NOT LIKE '%استلام%'
+                             AND COALESCE(s.status,'') NOT LIKE '%مستلمة%'
+                             AND COALESCE(s.status,'') NOT LIKE '%Delivered%'
+                             AND COALESCE(s.status,'') NOT LIKE '%مغلقة%'
+                           ORDER BY s.eta ASC""")
+            st.write(f"وجدت {len(df)} شحنة نشطة:")
             st.dataframe(df, use_container_width=True, hide_index=True)
         elif any(k in ql for k in ["دفع", "دفعة", "مستحق"]):
             df = fetch_df("""SELECT c.company_name AS الشركة,p.payment_type AS النوع,p.amount AS المبلغ,p.currency AS العملة,
