@@ -159,53 +159,102 @@ def ensure_columns(conn, table_name, columns):
 
 
 def migrate_legacy_suppliers(conn):
-    """Import old MIDO v1 supplier records once, preserving existing information."""
+    """Import old MIDO supplier records safely even if the legacy table has a different schema."""
     tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
     if 'suppliers' not in tables:
         return
+
     conn.execute("CREATE TABLE IF NOT EXISTS legacy_import_map (supplier_id INTEGER PRIMARY KEY, company_id INTEGER, imported_at TEXT)")
-    rows = conn.execute("SELECT id, company_name, bank_account, order_details, payment_date, shipment_status, unit_price, total_amount FROM suppliers").fetchall()
+
+    # Read whatever columns actually exist in the old suppliers table.
+    legacy_cols = table_columns(conn, 'suppliers')
+    rows = conn.execute("SELECT * FROM suppliers").fetchall()
+
+    def old_value(row, name, default=''):
+        if name not in legacy_cols:
+            return default
+        try:
+            value = row[name]
+        except Exception:
+            return default
+        return default if value is None else value
+
     for r in rows:
-        sid = r[0]
+        sid = old_value(r, 'id', None)
+        if sid is None:
+            # Very old/partial DBs may not expose an id column; use rowid instead.
+            continue
+
         done = conn.execute("SELECT 1 FROM legacy_import_map WHERE supplier_id=?", (sid,)).fetchone()
         if done:
             continue
-        name = (r[1] or f"Legacy Company {sid}").strip()
+
+        raw_name = old_value(r, 'company_name', '') or old_value(r, 'name', '')
+        name = str(raw_name or f"Legacy Company {sid}").strip()
+
         existing = conn.execute("SELECT id FROM companies WHERE company_name=? ORDER BY id LIMIT 1", (name,)).fetchone()
         if existing:
             company_id = existing[0]
         else:
-            cur = conn.execute("""INSERT INTO companies (company_name,country,notes,created_at) VALUES (?,?,?,?)""",
-                               (name, 'China', 'تم استيراد هذا السجل تلقائياً من نسخة MIDO القديمة.', now_text()))
+            cur = conn.execute(
+                "INSERT INTO companies (company_name,country,notes,created_at) VALUES (?,?,?,?)",
+                (name, 'China', 'تم استيراد هذا السجل تلقائياً من نسخة MIDO القديمة.', now_text())
+            )
             company_id = cur.lastrowid
-        bank = r[2] or ''
+
+        bank = str(old_value(r, 'bank_account', '') or '')
         if bank.strip():
-            conn.execute("""INSERT INTO bank_accounts (company_id,bank_name,account_number,notes,created_at) VALUES (?,?,?,?,?)""",
-                         (company_id, 'Legacy bank details', bank, 'مستورد من MIDO القديم', now_text()))
-        order_details = r[3] or ''
-        total_amount = float(r[7] or 0)
+            conn.execute(
+                "INSERT INTO bank_accounts (company_id,bank_name,account_number,notes,created_at) VALUES (?,?,?,?,?)",
+                (company_id, 'Legacy bank details', bank, 'مستورد من MIDO القديم', now_text())
+            )
+
+        order_details = str(old_value(r, 'order_details', '') or '')
+        try:
+            total_amount = float(old_value(r, 'total_amount', 0) or 0)
+        except Exception:
+            total_amount = 0.0
+
         order_id = None
         if order_details.strip() or total_amount:
-            cur = conn.execute("""INSERT INTO orders (company_id,order_number,order_date,product_summary,currency,total_amount,paid_amount,status,notes,created_at)
-                                  VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                               (company_id, f'LEGACY-{sid}', '', order_details, 'USD', total_amount, 0, 'مستوردة من النسخة القديمة', '', now_text()))
+            cur = conn.execute(
+                """INSERT INTO orders (company_id,order_number,order_date,product_summary,currency,total_amount,paid_amount,status,notes,created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (company_id, f'LEGACY-{sid}', '', order_details, 'USD', total_amount, 0, 'مستوردة من النسخة القديمة', '', now_text())
+            )
             order_id = cur.lastrowid
-        pay_date = r[4] or ''
+
+        pay_date = str(old_value(r, 'payment_date', '') or '')
         if pay_date:
-            conn.execute("""INSERT INTO payments (company_id,order_id,payment_type,due_date,currency,amount,status,notes,created_at)
-                              VALUES (?,?,?,?,?,?,?,?,?)""",
-                         (company_id, order_id, 'Legacy', pay_date, 'USD', total_amount, 'مستحقة', 'مستوردة من MIDO القديم', now_text()))
-        ship_status = r[5] or ''
+            conn.execute(
+                """INSERT INTO payments (company_id,order_id,payment_type,due_date,currency,amount,status,notes,created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (company_id, order_id, 'Legacy', pay_date, 'USD', total_amount, 'مستحقة', 'مستوردة من MIDO القديم', now_text())
+            )
+
+        ship_status = str(old_value(r, 'shipment_status', '') or '')
         if ship_status:
             normalized = 'تم الاستلام' if ('استلام' in ship_status or 'بالكامل' in ship_status) else ship_status
-            conn.execute("""INSERT INTO shipments (company_id,order_id,shipment_number,status,received_at,notes,created_at)
-                              VALUES (?,?,?,?,?,?,?)""",
-                         (company_id, order_id, f'LEGACY-{sid}', normalized, now_text() if normalized=='تم الاستلام' else '', 'مستوردة من MIDO القديم', now_text()))
-        unit_price = float(r[6] or 0)
+            conn.execute(
+                """INSERT INTO shipments (company_id,order_id,shipment_number,status,received_at,notes,created_at)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (company_id, order_id, f'LEGACY-{sid}', normalized, now_text() if normalized == 'تم الاستلام' else '', 'مستوردة من MIDO القديم', now_text())
+            )
+
+        try:
+            unit_price = float(old_value(r, 'unit_price', 0) or 0)
+        except Exception:
+            unit_price = 0.0
         if unit_price:
-            conn.execute("""INSERT INTO prices (company_id,product_name,unit_price,currency,quote_date,notes,created_at) VALUES (?,?,?,?,?,?,?)""",
-                         (company_id, order_details[:120] or 'Legacy item', unit_price, 'USD', '', 'مستورد من MIDO القديم', now_text()))
-        conn.execute("INSERT INTO legacy_import_map (supplier_id,company_id,imported_at) VALUES (?,?,?)", (sid, company_id, now_text()))
+            conn.execute(
+                "INSERT INTO prices (company_id,product_name,unit_price,currency,quote_date,notes,created_at) VALUES (?,?,?,?,?,?,?)",
+                (company_id, order_details[:120] or 'Legacy item', unit_price, 'USD', '', 'مستورد من MIDO القديم', now_text())
+            )
+
+        conn.execute(
+            "INSERT OR REPLACE INTO legacy_import_map (supplier_id,company_id,imported_at) VALUES (?,?,?)",
+            (sid, company_id, now_text())
+        )
 
 
 def init_db():
