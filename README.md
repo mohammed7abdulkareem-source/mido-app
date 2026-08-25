@@ -1,32 +1,33 @@
-MIDO ERP
-نسخة مطورة من برنامج ميدو لإدارة الشركات الصينية والطلبيات والفواتير والشحنات والدفعات والحسابات البنكية والمستندات والأسعار والوكالات.
-التشغيل
-pip install -r requirements.txt
-streamlit run app.py
-المزايا
-ملف كامل لكل شركة صينية
-طلبيات مستقلة وربطها بالشركة
-فواتير PI/CI ومواعيد استحقاق
-شحنات وحاويات وBL وETD/ETA
-دفعات وربطها بالطلبية والفاتورة والحساب البنكي
-حسابات بنكية للمصانع
-رفع PDF والصور الأصلية وربطها بالشركة/الطلبية/الشحنة/الفاتورة
-مقارنة أسعار حسب المنتج أو القياس
-الوكالات والبراندات
-مهام ومواعيد متابعة
-MIDO AI للبحث داخل البيانات، مع بنية جاهزة لإضافة AI حقيقي لاحقاً
-تنبيه أمني
-SQLite والتخزين المحلي مناسبان للنسخة الداخلية الأولية. عند النشر على الإنترنت يجب إضافة تسجيل دخول وصلاحيات، تشفير، نسخ احتياطي، وتخزين ملفات آمن قبل وضع بيانات بنكية أو مستندات حساسة.
-MIDO v3 — Dropbox
-كل PDF أو صورة أصلية تُرفع مباشرة إلى Dropbox داخل /MIDO/Companies/<Company>/Documents/<Type>/.
-قاعدة بيانات SQLite تُنسخ احتياطياً إلى /MIDO/System/mido_database.db بعد كل تعديل.
-على تشغيل جديد يحاول MIDO استرجاع قاعدة البيانات من Dropbox تلقائياً.
-لا تضع مفاتيح Dropbox في app.py أو GitHub. ضعها في Streamlit Cloud > App settings > Secrets.
-راجع .streamlit/secrets.example.toml لمعرفة أسماء المفاتيح المطلوبة.
-MIDO v4 additions
-Automatic database migrations: old SQLite tables are upgraded without deleting data.
-One-time import from the earliest suppliers schema when present.
-Shipment received/archive workflow.
-Received shipments are excluded from Dashboard important/active shipments and MIDO AI active-shipment results.
-received_at date stored automatically when marking a shipment as received.
-Original Dropbox document architecture from v3 retained.
+MIDO ERP v6 AI Suite
+نسخة مطورة من MIDO مبنية على Streamlit + SQLite + Dropbox + AI API.
+أهم المزايا
+شركات، طلبيات، فواتير، دفعات، حسابات بنكية، أسعار، وكالات، مهام.
+حالات الشحنات مع أرشفة الشحنات المستلمة وعدم ظهورها ضمن المهم.
+رفع عدة ملفات لكل شحنة دفعة واحدة: Invoice, Packing List, Certificate of Origin, BL, QR Code وغيرها.
+دعم PDF والصور وExcel (XLSX/XLS) وCSV وTXT.
+حفظ النسخ الأصلية في Dropbox داخل مجلد كل شركة/شحنة.
+إنشاء Shipment Package ZIP واحد يحتوي جميع الملفات الأصلية للشحنة مع manifest.
+MIDO AI لتحليل الملفات وتصنيف كل ملف واستخراج معلومات الشركة/الطلبية/الفاتورة/الشحنة/الدفعة/البنك/الأسعار.
+محادثة AI مع بيانات ERP.
+Voice AI: تسجيل الصوت وتحويله إلى نص ثم رد ميدو، مع TTS اختياري.
+Backup تلقائي لقاعدة البيانات إلى Dropbox مع snapshots دورية.
+AI Developer Inbox لتحويل طلبات تطوير MIDO إلى خطة تنفيذ محفوظة، من دون استبدال كود الإنتاج تلقائياً.
+Streamlit Secrets
+احتفظ بالمفاتيح في Streamlit Secrets فقط، وليس GitHub.
+[dropbox]
+access_token = "YOUR_DROPBOX_ACCESS_TOKEN"
+# root_folder = "/MIDO"
+
+[ai]
+api_key = "YOUR_AI_API_KEY"
+model = "YOUR_TEXT_AND_VISION_MODEL"
+# base_url = "OPTIONAL_PROVIDER_URL"
+
+# لتفعيل الصوت، ضع أسماء النماذج المتاحة لدى مزود AI الخاص بك:
+transcription_model = "YOUR_TRANSCRIPTION_MODEL"
+tts_model = "YOUR_TTS_MODEL"
+tts_voice = "YOUR_VOICE_NAME"
+ملاحظات مهمة
+Wake word دائم مثل Alexa يحتاج تطبيق Android Native وخدمة Microphone تعمل بالخلفية. نسخة Streamlit تستخدم زر تسجيل الصوت.
+MIDO لا يغيّر app.py تلقائياً في الإنتاج. تبويب مطور ميدو يحفظ خطة التطوير حتى لا يؤدي طلب خاطئ إلى كسر النظام أو فقد البيانات.
+يفضّل لاحقاً نقل SQLite إلى PostgreSQL عندما يصبح عدد المستخدمين كبيراً أو عند الحاجة للتزامن المتعدد.
