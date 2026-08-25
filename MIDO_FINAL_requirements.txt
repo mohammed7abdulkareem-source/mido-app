@@ -1,0 +1,7 @@
+streamlit
+pandas
+pypdf
+openpyxl
+python-docx
+reportlab
+dropbox
