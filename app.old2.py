@@ -8,6 +8,8 @@ import re
 import hashlib
 import zipfile
 import tempfile
+import urllib.request
+import urllib.error
 from datetime import datetime, date
 from pathlib import Path
 
