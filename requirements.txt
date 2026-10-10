@@ -5,3 +5,5 @@ openpyxl
 python-docx
 reportlab
 dropbox
+openai
+PyMuPDF
